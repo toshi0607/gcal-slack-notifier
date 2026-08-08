@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "description": "Googleカレンダーの予定変更をSlackチャンネルに通知するGASスクリプト",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "check": "node --check src/Code.js && node -e \"JSON.parse(require('fs').readFileSync('src/appsscript.json','utf8'))\"",
+    "check": "node --check src/Code.js && node -e \"JSON.parse(require('fs').readFileSync('src/appsscript.json','utf8'))\" && node -e \"JSON.parse(require('fs').readFileSync('plugin.json','utf8'))\" && node scripts/check-skill-sync.mjs",
     "login": "clasp login",
     "push": "clasp push",
     "pull": "clasp pull",

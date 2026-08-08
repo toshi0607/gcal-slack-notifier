@@ -1,0 +1,13 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "gcal-slack-notifier",
+  "version": "0.1.0",
+  "description": "Googleカレンダーの予定変更（追加・更新・削除）をSlackチャンネルに通知するGASツール。セットアップを案内・自動化するAgent Skillを含む。",
+  "author": {
+    "name": "toshi0607",
+    "url": "https://github.com/toshi0607"
+  },
+  "repository": "https://github.com/toshi0607/gcal-slack-notifier",
+  "license": "MIT",
+  "keywords": ["google-calendar", "slack", "google-apps-script", "clasp", "notification"]
+}
