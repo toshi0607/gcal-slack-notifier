@@ -1,0 +1,6 @@
+.clasp.json
+.clasprc.json
+node_modules/
+tasks/
+.claude/worktrees/
+.claude/settings.local.json

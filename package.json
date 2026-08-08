@@ -1,0 +1,16 @@
+{
+  "name": "gcal-slack-notifier",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Googleカレンダーの予定変更をSlackチャンネルに通知するGASスクリプト",
+  "scripts": {
+    "check": "node --check src/Code.js && node -e \"JSON.parse(require('fs').readFileSync('src/appsscript.json','utf8'))\"",
+    "login": "clasp login",
+    "push": "clasp push",
+    "pull": "clasp pull",
+    "open": "clasp open-script"
+  },
+  "devDependencies": {
+    "@google/clasp": "^3.3.0"
+  }
+}
