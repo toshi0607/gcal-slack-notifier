@@ -53,6 +53,8 @@ Googleカレンダーの設定 →「カレンダーの統合」→ カレンダ
 
 ### 3. GASプロジェクトを作成してソースを配置
 
+Node.js 20以上が必要（@google/clasp の要件）。
+
 ```bash
 npm install
 npm run login

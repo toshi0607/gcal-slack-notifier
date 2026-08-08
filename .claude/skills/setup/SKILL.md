@@ -27,7 +27,7 @@ Googleカレンダーの予定変更（追加・更新・削除）を指定のSl
 ### 1. 前提確認（エージェント）
 
 ```bash
-node --version   # v18以上
+node --version   # v20以上
 npm install
 npm run check    # 構文チェックが通ること
 ```
