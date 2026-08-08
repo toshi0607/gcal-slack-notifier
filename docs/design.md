@@ -79,6 +79,8 @@ sequenceDiagram
 | `formatMessage_(calendarId, ev)` | イベント状態から通知種別（追加/更新/削除）と本文を整形 |
 | `resolveTitle_(calendarId, ev)` | タイトルを解決。削除イベントで `summary` が無ければ親の繰り返し予定から補う |
 | `formatWhen_(ev)` | 日時表示を整形。繰り返しシリーズか個別occurrenceかを注記する |
+| `isPastOccurrence_(ev)` | 繰り返し予定の「過ぎた回」かを判定。通知対象から落とすために使う |
+| `toCalendarDate_(value)` | スクリプトのタイムゾーンで `yyyy-MM-dd` を返す |
 | `postToSlack_(webhookUrl, text)` | Incoming Webhook へ POST。429と5xxは再試行し、成否を返す |
 
 ### 繰り返し予定の扱い（`singleEvents: false`）
@@ -92,6 +94,19 @@ sequenceDiagram
 - 個別occurrenceの変更・削除は `recurringEventId` と `originalStartTime` を持つ別アイテムとして返るため、その回の日時を表示する
 
 なお `syncToken` は取得時のクエリパラメータと紐づくため、`singleEvents` を変更したら `initialize()` をやり直す必要がある。
+
+### 過ぎた回の除外
+
+繰り返しシリーズを1回編集すると、そのシリーズに紐づく**過去の例外インスタンス**（過去に個別変更・削除した回）まで差分として返る。`initialize()` の `timeMin` はフル同期の範囲を絞るだけで、例外インスタンスには効かない（2026-08-08 に実測: 常用の繰り返し予定を数件編集しただけで、数か月前の回の削除通知が48件発生した）。
+
+そこで `isPastOccurrence_()` で以下を通知対象から落とす。
+
+- `recurringEventId` を持つ（＝シリーズ本体ではなく個別の回）
+- かつ `originalStartTime`（無ければ `start`）の**日付**が今日より前
+
+判定を日付単位にしているのは、今日の回を残すため。「今夜のごはんを1件だけ削除」は通知される。シリーズ本体は開始日が過去でも除外しない — 「その繰り返し予定を変更した」こと自体は知りたいため。
+
+除外は通知件数の上限判定より前に行う。過去回だけで上限を超えてサーキットブレーカーが誤作動するのを避ける。
 
 ### 通知件数の上限
 
