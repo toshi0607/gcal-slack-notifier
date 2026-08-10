@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "toshi0607-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "toshi0607/claude-plugins"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "tachikoma-tone@toshi0607-plugins": true
+  }
+}
