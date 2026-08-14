@@ -1,11 +1,13 @@
 /***** 設定はスクリプト プロパティに置く（プロジェクトの設定 → スクリプト プロパティ）
  *   CALENDAR_ID          監視対象カレンダーのID。カンマ区切りで複数指定できる
  *   SLACK_WEBHOOK_URL    Slack Incoming Webhook の URL
- *   SYNC_TOKEN:<カレンダーID>  差分同期用トークン（initialize() が自動で保存する。手動設定不要）
+ *   SYNC_TOKEN:<カレンダーID>   差分同期用トークン（initialize() が自動で保存する。手動設定不要）
+ *   LAST_SYNC_AT:<カレンダーID> 前回の差分取得を開始した時刻（同上）
  *****/
 const PROP_CALENDAR_ID = 'CALENDAR_ID';
 const PROP_SLACK_WEBHOOK_URL = 'SLACK_WEBHOOK_URL';
 const PROP_SYNC_TOKEN_PREFIX = 'SYNC_TOKEN:';
+const PROP_LAST_SYNC_AT_PREFIX = 'LAST_SYNC_AT:';
 
 // 単一カレンダーのみ対応していた頃のキー。移行のためだけに参照する
 const PROP_LEGACY_SYNC_TOKEN = 'SYNC_TOKEN';
@@ -19,6 +21,11 @@ const SINGLE_EVENTS = false;
 
 // Slack投稿のリトライ回数（429と5xxのみ再試行する）
 const SLACK_POST_ATTEMPTS = 3;
+
+// 「前回の実行より後に更新されたか」を判定するときの許容誤差（ミリ秒）。
+// updated はカレンダー側が打つ時刻、比較相手はスクリプト側で測った実行開始時刻なので、
+// 時計のずれと差分APIへの反映遅れの分だけ緩めに見る（迷ったら通知する側に倒す）
+const UPDATED_SKEW_MS = 60 * 1000;
 
 function getConfig_() {
   const props = PropertiesService.getScriptProperties();
@@ -41,6 +48,10 @@ function syncTokenKey_(calendarId) {
   return PROP_SYNC_TOKEN_PREFIX + calendarId;
 }
 
+function lastSyncAtKey_(calendarId) {
+  return PROP_LAST_SYNC_AT_PREFIX + calendarId;
+}
+
 /**
  * 初回のみ手動実行: 各カレンダーの現時点を基点に記録（通知は出さない）
  */
@@ -48,10 +59,22 @@ function initialize() {
   const config = getConfig_();
   const props = PropertiesService.getScriptProperties();
   for (const calendarId of config.calendarIds) {
-    props.setProperty(syncTokenKey_(calendarId), fetchInitialSyncToken_(calendarId));
+    resetBaseline_(props, calendarId);
   }
   props.deleteProperty(PROP_LEGACY_SYNC_TOKEN);
   console.log('初期化完了: ' + config.calendarIds.length + '件のカレンダー');
+}
+
+/**
+ * 現時点を差分の基点として記録する。通知は出さない。
+ *
+ * 実行開始時刻は `fetchInitialSyncToken_()` を呼ぶ前に測る。フル同期の最中に入った変更は
+ * 次回の差分に乗るので、後で測ると「前回実行より前の更新」と誤判定して落としてしまう。
+ */
+function resetBaseline_(props, calendarId) {
+  const startedAt = new Date();
+  props.setProperty(syncTokenKey_(calendarId), fetchInitialSyncToken_(calendarId));
+  props.setProperty(lastSyncAtKey_(calendarId), startedAt.toISOString());
 }
 
 /**
@@ -104,10 +127,12 @@ function notifyOneCalendar_(props, config, calendarId) {
   const tokenKey = syncTokenKey_(calendarId);
   let syncToken = props.getProperty(tokenKey);
   if (!syncToken) {
-    props.setProperty(tokenKey, fetchInitialSyncToken_(calendarId));
+    resetBaseline_(props, calendarId);
     console.log(calendarId + ': 基準点を作成しました（通知なし）');
     return 0;
   }
+  const startedAt = new Date();
+  const lastSyncAt = readLastSyncAt_(props, calendarId);
 
   let pageToken;
   let calendarName = '';
@@ -130,13 +155,20 @@ function notifyOneCalendar_(props, config, calendarId) {
     // それ以外（一時的なエラー・クォータ超過など）は再スローし、GASの失敗通知メールに載せる
     if (!isSyncTokenExpired_(e)) throw e;
     console.warn(calendarId + ': syncToken失効のため基準点を取り直します: ' + e);
-    props.setProperty(tokenKey, fetchInitialSyncToken_(calendarId));
+    resetBaseline_(props, calendarId);
     return 0;
   }
   props.setProperty(tokenKey, syncToken);
+  props.setProperty(lastSyncAtKey_(calendarId), startedAt.toISOString());
 
-  const notifiable = changed.filter(function (ev) { return !isPastOccurrence_(ev); });
-  const skipped = changed.length - notifiable.length;
+  const changedThisTime = changed.filter(function (ev) { return !isUnchangedResend_(ev, lastSyncAt); });
+  const resent = changed.length - changedThisTime.length;
+  if (resent > 0) {
+    console.log(calendarId + ': 巻き添えの再送 ' + resent + '件を通知対象から除外');
+  }
+
+  const notifiable = changedThisTime.filter(function (ev) { return !isPastOccurrence_(ev); });
+  const skipped = changedThisTime.length - notifiable.length;
   if (skipped > 0) {
     console.log(calendarId + ': 過去回の変更 ' + skipped + '件を通知対象から除外');
   }
@@ -159,6 +191,40 @@ function notifyOneCalendar_(props, config, calendarId) {
     if (!postToSlack_(config.webhookUrl, formatMessage_(calendarId, ev) + suffix)) failures++;
   }
   return failures;
+}
+
+/**
+ * 今回は変更されていないのに差分へ巻き添えで乗ってきたイベントかどうか。
+ *
+ * 繰り返し予定を1回分だけ削除すると、差分にはその回だけでなく
+ * シリーズ本体や、以前に個別変更・削除した他の回まで一緒に返ってくる
+ * （2026-08-14 に実測: 1回分の削除で、シリーズ本体2件と別の回の削除2件を巻き添えに、
+ * 計5件のSlack通知が飛んだ）。
+ *
+ * 巻き添え分は「再送されただけで中身は変わっていない」ので、`updated`（そのイベント自身が
+ * 最後に更新された時刻）が前回の実行開始より前になる。実際に今回変更されたイベントだけが
+ * 新しい `updated` を持つので、そこで切り分ける。
+ *
+ * `updated` が読めないときや基準時刻が無いとき（この機能より前から動いている環境の初回）は
+ * 落とさない。通知が重複するより、消えるほうが困るため。
+ */
+function isUnchangedResend_(ev, lastSyncAt) {
+  if (!lastSyncAt || !ev.updated) return false;
+  const updated = new Date(ev.updated).getTime();
+  if (isNaN(updated)) return false;
+  return updated < lastSyncAt.getTime() - UPDATED_SKEW_MS;
+}
+
+/** 前回の差分取得を開始した時刻。未記録・壊れている場合は null（＝再送の判定をしない） */
+function readLastSyncAt_(props, calendarId) {
+  const raw = props.getProperty(lastSyncAtKey_(calendarId));
+  if (!raw) return null;
+  const at = new Date(raw);
+  if (isNaN(at.getTime())) {
+    console.warn(calendarId + ': ' + lastSyncAtKey_(calendarId) + ' を日時として読めません: ' + raw);
+    return null;
+  }
+  return at;
 }
 
 /**

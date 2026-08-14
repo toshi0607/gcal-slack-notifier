@@ -76,7 +76,7 @@ GASエディタ（`npm run open` で開ける）→ 左メニュー「プロジ�
 | `CALENDAR_ID` | 手順5のカレンダーID。複数はカンマ区切り |
 | `SLACK_WEBHOOK_URL` | 手順4のWebhook URL |
 
-`SYNC_TOKEN:...` は自動生成されるため設定不要。
+`SYNC_TOKEN:...` と `LAST_SYNC_AT:...` は自動生成されるため設定不要。
 
 ### 7. 初期化とOAuth承認（ユーザー）
 
