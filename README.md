@@ -19,6 +19,9 @@ src/
 docs/
   design.md          設計書
   tasks.md           タスク分解
+test/
+  notify.test.mjs    通知ロジックの回帰テスト（node --test）
+  gas-harness.mjs    GASのグローバルを差し替えて src/Code.js を動かすハーネス
 scripts/
   delete-slack-messages.mjs  通知の一括削除（運用ツール）
   check-skill-sync.mjs       skills/ と .claude/skills/ の同期チェック
@@ -75,7 +78,7 @@ GASエディタの「プロジェクトの設定」→「スクリプト プロ�
 | `CALENDAR_ID` | 手順2のカレンダーID。複数監視する場合はカンマ区切り（例: `a@group.calendar.google.com,b@group.calendar.google.com`） |
 | `SLACK_WEBHOOK_URL` | 手順1のWebhook URL |
 
-`SYNC_TOKEN:<カレンダーID>` は `initialize()` が自動で保存するため手動設定は不要。
+`SYNC_TOKEN:<カレンダーID>` と `SEEN_EVENTS:<カレンダーID>` はスクリプトが自動で保存するため手動設定は不要。
 
 監視対象が2件以上のときは、通知の末尾にどのカレンダーの変更かが添えられる。
 
@@ -92,7 +95,8 @@ GASエディタの「プロジェクトの設定」→「スクリプト プロ�
 ## 開発
 
 ```bash
-npm run check   # 構文チェック（node --check + マニフェストのJSONパース）
+npm run check   # 構文チェック（node --check + マニフェストのJSONパース）+ テスト
+npm test        # テストのみ（node --test）
 npm run push    # GASへデプロイ
 npm run pull    # GAS側の変更を取り込む
 ```

@@ -1,11 +1,13 @@
 /***** 設定はスクリプト プロパティに置く（プロジェクトの設定 → スクリプト プロパティ）
  *   CALENDAR_ID          監視対象カレンダーのID。カンマ区切りで複数指定できる
  *   SLACK_WEBHOOK_URL    Slack Incoming Webhook の URL
- *   SYNC_TOKEN:<カレンダーID>  差分同期用トークン（initialize() が自動で保存する。手動設定不要）
+ *   SYNC_TOKEN:<カレンダーID>    差分同期用トークン（initialize() が自動で保存する。手動設定不要）
+ *   SEEN_EVENTS:<カレンダーID>   直近に見たイベントの指紋（同上）
  *****/
 const PROP_CALENDAR_ID = 'CALENDAR_ID';
 const PROP_SLACK_WEBHOOK_URL = 'SLACK_WEBHOOK_URL';
 const PROP_SYNC_TOKEN_PREFIX = 'SYNC_TOKEN:';
+const PROP_SEEN_EVENTS_PREFIX = 'SEEN_EVENTS:';
 
 // 単一カレンダーのみ対応していた頃のキー。移行のためだけに参照する
 const PROP_LEGACY_SYNC_TOKEN = 'SYNC_TOKEN';
@@ -19,6 +21,15 @@ const SINGLE_EVENTS = false;
 
 // Slack投稿のリトライ回数（429と5xxのみ再試行する）
 const SLACK_POST_ATTEMPTS = 3;
+
+// 指紋の保存量。Script Properties の1プロパティあたりの上限（9KB）に収める。
+// 溢れたら古いものから捨てる（捨てた分は次に出会ったとき通知される＝安全側）
+const SEEN_EVENTS_MAX_ENTRIES = 300;
+const SEEN_EVENTS_MAX_BYTES = 8000;
+
+// 指紋に含めないフィールド。中身が同じでも変わりうるもの・通知に関係しないもの。
+// ここに挙げていないフィールドは未知のものも含めて指紋に入る（変化を見落とさない側に倒す）
+const FINGERPRINT_IGNORED_FIELDS = ['etag', 'kind', 'htmlLink'];
 
 function getConfig_() {
   const props = PropertiesService.getScriptProperties();
@@ -39,6 +50,10 @@ function getConfig_() {
 
 function syncTokenKey_(calendarId) {
   return PROP_SYNC_TOKEN_PREFIX + calendarId;
+}
+
+function seenEventsKey_(calendarId) {
+  return PROP_SEEN_EVENTS_PREFIX + calendarId;
 }
 
 /**
@@ -104,7 +119,7 @@ function notifyOneCalendar_(props, config, calendarId) {
   const tokenKey = syncTokenKey_(calendarId);
   let syncToken = props.getProperty(tokenKey);
   if (!syncToken) {
-    props.setProperty(tokenKey, fetchInitialSyncToken_(calendarId));
+    props.setProperty(syncTokenKey_(calendarId), fetchInitialSyncToken_(calendarId));
     console.log(calendarId + ': 基準点を作成しました（通知なし）');
     return 0;
   }
@@ -130,13 +145,23 @@ function notifyOneCalendar_(props, config, calendarId) {
     // それ以外（一時的なエラー・クォータ超過など）は再スローし、GASの失敗通知メールに載せる
     if (!isSyncTokenExpired_(e)) throw e;
     console.warn(calendarId + ': syncToken失効のため基準点を取り直します: ' + e);
-    props.setProperty(tokenKey, fetchInitialSyncToken_(calendarId));
+    props.setProperty(syncTokenKey_(calendarId), fetchInitialSyncToken_(calendarId));
     return 0;
   }
   props.setProperty(tokenKey, syncToken);
 
-  const notifiable = changed.filter(function (ev) { return !isPastOccurrence_(ev); });
-  const skipped = changed.length - notifiable.length;
+  const seen = readSeenEvents_(props, calendarId);
+  const fingerprints = toFingerprintMap_(seen);
+  writeSeenEvents_(props, calendarId, seen, changed);
+
+  const changedThisTime = changed.filter(function (ev) { return !isUnchangedResend_(ev, fingerprints); });
+  const resent = changed.length - changedThisTime.length;
+  if (resent > 0) {
+    console.log(calendarId + ': 巻き添えの再送 ' + resent + '件を通知対象から除外');
+  }
+
+  const notifiable = changedThisTime.filter(function (ev) { return !isPastOccurrence_(ev); });
+  const skipped = changedThisTime.length - notifiable.length;
   if (skipped > 0) {
     console.log(calendarId + ': 過去回の変更 ' + skipped + '件を通知対象から除外');
   }
@@ -159,6 +184,103 @@ function notifyOneCalendar_(props, config, calendarId) {
     if (!postToSlack_(config.webhookUrl, formatMessage_(calendarId, ev) + suffix)) failures++;
   }
   return failures;
+}
+
+/**
+ * 今回は変更されていないのに差分へ巻き添えで乗ってきたイベントかどうか。
+ *
+ * 繰り返し予定を1回分だけ削除しても、差分にはその回だけが乗るとは限らない。シリーズ本体や、
+ * 以前に個別変更・削除した他の回まで一緒に返ってくる（2026-08-14 に実測: 9/2 の1回を削除した
+ * だけで、シリーズ本体2件と別の回の削除2件を巻き添えに、計5件のSlack通知が飛んだ）。
+ *
+ * 判定は「前回このイベントを見たときと中身が1バイトも変わっていないか」で行う。
+ * `updated` は使わない。`updated` は main event data の最終更新時刻で、
+ * リマインダーだけを変更しても進まないため（公式リファレンスに明記されている）、
+ * 古いままであることは「変わっていない」ことの証明にならない。
+ *
+ * 指紋を記録していない初見のイベントは落とさない。変わっていないと確認できていないため。
+ * 巻き添えの回も一度は通知され、そこで指紋が残るので、次の巻き添えからは黙る。
+ */
+function isUnchangedResend_(ev, fingerprints) {
+  if (!ev.id) return false;
+  const previous = fingerprints[ev.id];
+  if (!previous) return false;
+  return previous === eventFingerprint_(ev);
+}
+
+/**
+ * イベントの中身の指紋。`FINGERPRINT_IGNORED_FIELDS` 以外は未知のフィールドも含めて対象にする。
+ * リマインダーだけの変更も `reminders` の差として指紋に出るため、取りこぼさない。
+ */
+function eventFingerprint_(ev) {
+  const bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.MD5, JSON.stringify(canonicalize_(ev)), Utilities.Charset.UTF_8);
+  let hex = '';
+  // 先頭8バイト（64bit）まで。数百件しか持たないので衝突は実質起きない
+  for (let i = 0; i < 8; i++) {
+    hex += ('0' + (bytes[i] & 0xff).toString(16)).slice(-2);
+  }
+  return hex;
+}
+
+/** 指紋を取るための正規化。キーの並び順に左右されないようソートし、無視するフィールドを落とす */
+function canonicalize_(value) {
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(function (v) { return canonicalize_(v); });
+  const out = {};
+  for (const key of Object.keys(value).sort()) {
+    if (FINGERPRINT_IGNORED_FIELDS.indexOf(key) >= 0) continue;
+    out[key] = canonicalize_(value[key]);
+  }
+  return out;
+}
+
+/** 保存済みの指紋。`[[イベントID, 指紋], ...]` の新しい順。読めなければ空（＝何も落とさない） */
+function readSeenEvents_(props, calendarId) {
+  const raw = props.getProperty(seenEventsKey_(calendarId));
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    console.warn(calendarId + ': ' + seenEventsKey_(calendarId) + ' を読めないため作り直します: ' + e);
+    return [];
+  }
+}
+
+function toFingerprintMap_(entries) {
+  const map = Object.create(null);
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry.length !== 2) continue;
+    if (map[entry[0]] === undefined) map[entry[0]] = entry[1];
+  }
+  return map;
+}
+
+/**
+ * 今回見たイベントの指紋を先頭に積み直して保存する。上限を超えた分は古い順に捨てる。
+ * 通知したかどうかに関わらず、差分で見たものはすべて記録する（落とした回の再送も黙らせるため）。
+ */
+function writeSeenEvents_(props, calendarId, previous, events) {
+  const recorded = Object.create(null);
+  const entries = [];
+  const push = function (id, fingerprint) {
+    if (!id || recorded[id]) return;
+    recorded[id] = true;
+    entries.push([id, fingerprint]);
+  };
+  for (const ev of events) push(ev.id, eventFingerprint_(ev));
+  for (const entry of previous) {
+    if (Array.isArray(entry) && entry.length === 2) push(entry[0], entry[1]);
+  }
+
+  entries.length = Math.min(entries.length, SEEN_EVENTS_MAX_ENTRIES);
+  let json = JSON.stringify(entries);
+  while (entries.length && json.length > SEEN_EVENTS_MAX_BYTES) {
+    entries.pop();
+    json = JSON.stringify(entries);
+  }
+  props.setProperty(seenEventsKey_(calendarId), json);
 }
 
 /**
