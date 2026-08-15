@@ -151,19 +151,29 @@ function notifyOneCalendar_(props, config, calendarId) {
   props.setProperty(tokenKey, syncToken);
 
   const seen = readSeenEvents_(props, calendarId);
-  const fingerprints = toFingerprintMap_(seen);
+  const fingerprints = toFingerprintMaps_(seen);
   writeSeenEvents_(props, calendarId, seen, changed);
 
-  const changedThisTime = changed.filter(function (ev) { return !isUnchangedResend_(ev, fingerprints); });
+  const changedThisTime = changed.filter(function (ev) { return !isUnchangedResend_(ev, fingerprints.content); });
   const resent = changed.length - changedThisTime.length;
   if (resent > 0) {
     console.log(calendarId + ': 巻き添えの再送 ' + resent + '件を通知対象から除外');
   }
 
-  const notifiable = changedThisTime.filter(function (ev) { return !isPastOccurrence_(ev); });
-  const skipped = changedThisTime.length - notifiable.length;
+  const currentEvents = changedThisTime.filter(function (ev) { return !isPastOccurrence_(ev); });
+  const skipped = changedThisTime.length - currentEvents.length;
   if (skipped > 0) {
     console.log(calendarId + ': 過去回の変更 ' + skipped + '件を通知対象から除外');
+  }
+
+  // 「この回を通知する」ぶんのシリーズ本体は黙らせる。判定は通知する回だけを見る
+  const notifiedParents = parentIdsOf_(currentEvents);
+  const notifiable = currentEvents.filter(function (ev) {
+    return !isSeriesEchoOfOccurrence_(calendarId, ev, notifiedParents, fingerprints.message);
+  });
+  const echoed = currentEvents.length - notifiable.length;
+  if (echoed > 0) {
+    console.log(calendarId + ': 回の変更に伴うシリーズ本体 ' + echoed + '件を通知対象から除外');
   }
 
   // 監視対象が1件だけならカレンダー名は自明なので添えない
@@ -184,6 +194,39 @@ function notifyOneCalendar_(props, config, calendarId) {
     if (!postToSlack_(config.webhookUrl, formatMessage_(calendarId, ev) + suffix)) failures++;
   }
   return failures;
+}
+
+/**
+ * 繰り返し予定の「1回」を変更したときに、一緒に返ってくるシリーズ本体かどうか。
+ *
+ * 1回分を削除・変更すると、その回だけでなくシリーズ本体も差分に乗る（2026-08-15 に実測:
+ * 8/19 の回を削除したところ、回の削除通知とシリーズ本体の更新通知が対で飛んだ）。
+ * 本体側は `updated` などの管理情報が動くだけで、通知に出る内容は前と同じになる。
+ *
+ * そこで、次のすべてを満たすシリーズ本体を落とす。
+ *
+ * - 同じ差分に、その本体に属する回が居て、その回を今回通知する
+ * - 本体について前回送った通知の文面と、今回送る文面が同じ（＝伝えることが増えていない）
+ *
+ * 「通知する回が居るとき」に限るのがポイント。回を落とした（過去回・再送）結果として
+ * 本体だけが残る場合は、本体の通知が唯一の知らせになるので黙らせない。
+ * 文面が変わるシリーズ自体の変更（タイトル変更・シリーズ全体の削除など）も従来どおり通知する。
+ */
+function isSeriesEchoOfOccurrence_(calendarId, ev, notifiedParents, messageFingerprints) {
+  if (!ev.recurrence || !ev.id) return false;
+  if (!notifiedParents[ev.id]) return false;
+  const previous = messageFingerprints[ev.id];
+  if (!previous) return false;
+  return previous === messageFingerprint_(calendarId, ev);
+}
+
+/** 差分に含まれる「繰り返しのうち1回」の親IDを集める */
+function parentIdsOf_(events) {
+  const parents = Object.create(null);
+  for (const ev of events) {
+    if (ev.recurringEventId) parents[ev.recurringEventId] = true;
+  }
+  return parents;
 }
 
 /**
@@ -213,8 +256,16 @@ function isUnchangedResend_(ev, fingerprints) {
  * リマインダーだけの変更も `reminders` の差として指紋に出るため、取りこぼさない。
  */
 function eventFingerprint_(ev) {
-  const bytes = Utilities.computeDigest(
-    Utilities.DigestAlgorithm.MD5, JSON.stringify(canonicalize_(ev)), Utilities.Charset.UTF_8);
+  return digest_(JSON.stringify(canonicalize_(ev)));
+}
+
+/** そのイベントについて送る通知の文面の指紋。中身ではなく「伝える内容」が変わったかを見る */
+function messageFingerprint_(calendarId, ev) {
+  return digest_(formatMessage_(calendarId, ev));
+}
+
+function digest_(text) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, text, Utilities.Charset.UTF_8);
   let hex = '';
   // 先頭8バイト（64bit）まで。数百件しか持たないので衝突は実質起きない
   for (let i = 0; i < 8; i++) {
@@ -235,7 +286,10 @@ function canonicalize_(value) {
   return out;
 }
 
-/** 保存済みの指紋。`[[イベントID, 指紋], ...]` の新しい順。読めなければ空（＝何も落とさない） */
+/**
+ * 保存済みの指紋。`[[イベントID, 中身の指紋, 文面の指紋?], ...]` の新しい順。
+ * 文面の指紋はシリーズ本体にだけ付く。読めなければ空（＝何も落とさない）
+ */
 function readSeenEvents_(props, calendarId) {
   const raw = props.getProperty(seenEventsKey_(calendarId));
   if (!raw) return [];
@@ -248,13 +302,16 @@ function readSeenEvents_(props, calendarId) {
   }
 }
 
-function toFingerprintMap_(entries) {
-  const map = Object.create(null);
+function toFingerprintMaps_(entries) {
+  const content = Object.create(null);
+  const message = Object.create(null);
   for (const entry of entries) {
-    if (!Array.isArray(entry) || entry.length !== 2) continue;
-    if (map[entry[0]] === undefined) map[entry[0]] = entry[1];
+    if (!Array.isArray(entry) || entry.length < 2 || !entry[0]) continue;
+    if (content[entry[0]] !== undefined) continue;
+    content[entry[0]] = entry[1];
+    if (entry[2]) message[entry[0]] = entry[2];
   }
-  return map;
+  return { content: content, message: message };
 }
 
 /**
@@ -264,14 +321,19 @@ function toFingerprintMap_(entries) {
 function writeSeenEvents_(props, calendarId, previous, events) {
   const recorded = Object.create(null);
   const entries = [];
-  const push = function (id, fingerprint) {
-    if (!id || recorded[id]) return;
-    recorded[id] = true;
-    entries.push([id, fingerprint]);
+  const push = function (entry) {
+    if (!entry[0] || recorded[entry[0]]) return;
+    recorded[entry[0]] = true;
+    entries.push(entry);
   };
-  for (const ev of events) push(ev.id, eventFingerprint_(ev));
+  for (const ev of events) {
+    // 文面の指紋を持つのはシリーズ本体だけ。回の変更に伴う本体を黙らせるのに使う
+    push(ev.recurrence
+      ? [ev.id, eventFingerprint_(ev), messageFingerprint_(calendarId, ev)]
+      : [ev.id, eventFingerprint_(ev)]);
+  }
   for (const entry of previous) {
-    if (Array.isArray(entry) && entry.length === 2) push(entry[0], entry[1]);
+    if (Array.isArray(entry) && entry.length >= 2) push(entry);
   }
 
   entries.length = Math.min(entries.length, SEEN_EVENTS_MAX_ENTRIES);

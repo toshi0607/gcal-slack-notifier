@@ -51,6 +51,71 @@ test('巻き添えの再送は、前回と中身が同じなら通知しない',
   assert.match(second.posts[0], /2026-09-09T19:30:00\+09:00（繰り返しのうち1回）/);
 });
 
+test('回を削除したときに一緒に返ってくるシリーズ本体は通知しない', () => {
+  const calendar = createSyncedCalendar();
+  const gym = { ...series('G', '2025-01-15T09:00:00+09:00', '2026-06-01T00:00:00Z'), summary: '🐸ジム' };
+
+  // 1回目: 本体は初見なので通知され、ここで文面の指紋が残る
+  const first = calendar.run({ items: [gym, seriesA] });
+  assert.equal(first.posts.length, 2);
+
+  // 2回目: 8/19 の回を削除する。本体は updated と sequence だけが動く
+  const touched = (s) => ({ ...s, updated: '2026-08-15T00:06:00Z', sequence: 3 });
+  const second = calendar.run({
+    items: [
+      touched(gym),
+      cancelledOccurrence('G_20260819', 'G', '2026-08-19T09:00:00+09:00', '2026-08-15T00:06:00Z'),
+      touched(seriesA),
+      cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+    ],
+  });
+
+  assert.deepEqual(headlines(second.posts), ['🗑️ 予定が削除されました', '🗑️ 予定が削除されました']);
+  assert.ok(second.posts.every((p) => p.includes('2026-08-19')));
+});
+
+test('シリーズ本体そのものの変更は、同じ差分に回が居ても通知する', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  const renamed = { ...seriesA, summary: 'ごはん（改）', updated: '2026-08-15T00:06:00Z' };
+  const second = calendar.run({
+    items: [renamed, cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z')],
+  });
+
+  assert.equal(second.posts.length, 2);
+  assert.ok(second.posts.some((p) => p.includes('ごはん（改）') && p.startsWith('✏️')));
+});
+
+test('通知する回が無ければ、シリーズ本体は黙らせない', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  // 差分に乗った回が過去回だけなら、本体の通知が唯一の知らせになる
+  const second = calendar.run({
+    items: [
+      { ...seriesA, updated: '2026-08-15T00:06:00Z', sequence: 3 },
+      cancelledOccurrence('A_20260701', 'A', '2026-07-01T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+    ],
+  });
+
+  assert.deepEqual(headlines(second.posts), ['✏️ 予定が更新されました']);
+});
+
+test('シリーズ全体を削除したら本体の削除を通知する', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  const second = calendar.run({
+    items: [
+      { ...seriesA, status: 'cancelled', updated: '2026-08-15T00:06:00Z' },
+      cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+    ],
+  });
+
+  assert.ok(second.posts.some((p) => p.startsWith('🗑️') && p.includes('繰り返し予定')));
+});
+
 test('リマインダーだけの変更は通知する（updated が進まないケース）', () => {
   const calendar = createSyncedCalendar();
   calendar.run({ items: [single] });
