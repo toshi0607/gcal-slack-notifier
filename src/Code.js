@@ -31,6 +31,10 @@ const SEEN_EVENTS_MAX_BYTES = 8000;
 // ここに挙げていないフィールドは未知のものも含めて指紋に入る（変化を見落とさない側に倒す）
 const FINGERPRINT_IGNORED_FIELDS = ['etag', 'kind', 'htmlLink'];
 
+// 回を操作したときにシリーズ本体側で動く管理情報。
+// 「本体そのものは変わっていない」を見分けるときだけ、上に加えて無視する
+const BOOKKEEPING_FIELDS = ['updated', 'sequence'];
+
 function getConfig_() {
   const props = PropertiesService.getScriptProperties();
   const rawCalendarIds = props.getProperty(PROP_CALENDAR_ID);
@@ -169,7 +173,7 @@ function notifyOneCalendar_(props, config, calendarId) {
   // 「この回を通知する」ぶんのシリーズ本体は黙らせる。判定は通知する回だけを見る
   const notifiedParents = parentIdsOf_(currentEvents);
   const notifiable = currentEvents.filter(function (ev) {
-    return !isSeriesEchoOfOccurrence_(calendarId, ev, notifiedParents, fingerprints.message);
+    return !isSeriesEchoOfOccurrence_(ev, notifiedParents, fingerprints.semantic);
   });
   const echoed = currentEvents.length - notifiable.length;
   if (echoed > 0) {
@@ -201,23 +205,26 @@ function notifyOneCalendar_(props, config, calendarId) {
  *
  * 1回分を削除・変更すると、その回だけでなくシリーズ本体も差分に乗る（2026-08-15 に実測:
  * 8/19 の回を削除したところ、回の削除通知とシリーズ本体の更新通知が対で飛んだ）。
- * 本体側は `updated` などの管理情報が動くだけで、通知に出る内容は前と同じになる。
+ * このとき本体側で動くのは `updated`・`sequence` といった管理情報だけになる。
  *
  * そこで、次のすべてを満たすシリーズ本体を落とす。
  *
  * - 同じ差分に、その本体に属する回が居て、その回を今回通知する
- * - 本体について前回送った通知の文面と、今回送る文面が同じ（＝伝えることが増えていない）
+ * - 管理情報を除いた指紋が前回と同じ（＝本体そのものは何も変わっていない）
  *
  * 「通知する回が居るとき」に限るのがポイント。回を落とした（過去回・再送）結果として
  * 本体だけが残る場合は、本体の通知が唯一の知らせになるので黙らせない。
- * 文面が変わるシリーズ自体の変更（タイトル変更・シリーズ全体の削除など）も従来どおり通知する。
+ *
+ * 判定に通知の文面を使わないのは、文面に出るのがタイトル・日時・種別だけだから。
+ * 文面で比べると、リマインダー・繰り返しルール・終了日時・場所・説明・参加者といった
+ * 「文面に出ないシリーズの変更」が回の操作と同じ差分に来たときに握りつぶしてしまう。
  */
-function isSeriesEchoOfOccurrence_(calendarId, ev, notifiedParents, messageFingerprints) {
+function isSeriesEchoOfOccurrence_(ev, notifiedParents, semanticFingerprints) {
   if (!ev.recurrence || !ev.id) return false;
   if (!notifiedParents[ev.id]) return false;
-  const previous = messageFingerprints[ev.id];
+  const previous = semanticFingerprints[ev.id];
   if (!previous) return false;
-  return previous === messageFingerprint_(calendarId, ev);
+  return previous === semanticFingerprint_(ev);
 }
 
 /** 差分に含まれる「繰り返しのうち1回」の親IDを集める */
@@ -256,12 +263,16 @@ function isUnchangedResend_(ev, fingerprints) {
  * リマインダーだけの変更も `reminders` の差として指紋に出るため、取りこぼさない。
  */
 function eventFingerprint_(ev) {
-  return digest_(JSON.stringify(canonicalize_(ev)));
+  return digest_(JSON.stringify(canonicalize_(ev, FINGERPRINT_IGNORED_FIELDS)));
 }
 
-/** そのイベントについて送る通知の文面の指紋。中身ではなく「伝える内容」が変わったかを見る */
-function messageFingerprint_(calendarId, ev) {
-  return digest_(formatMessage_(calendarId, ev));
+/**
+ * 管理情報（`BOOKKEEPING_FIELDS`）を除いた指紋。
+ * 「回を操作したせいで乗っただけか、本体そのものが変わったか」を見分けるのに使う。
+ * リマインダー・繰り返しルール・終了日時・場所・説明・参加者の変更はここに出る。
+ */
+function semanticFingerprint_(ev) {
+  return digest_(JSON.stringify(canonicalize_(ev, FINGERPRINT_IGNORED_FIELDS.concat(BOOKKEEPING_FIELDS))));
 }
 
 function digest_(text) {
@@ -275,20 +286,20 @@ function digest_(text) {
 }
 
 /** 指紋を取るための正規化。キーの並び順に左右されないようソートし、無視するフィールドを落とす */
-function canonicalize_(value) {
+function canonicalize_(value, ignoredFields) {
   if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map(function (v) { return canonicalize_(v); });
+  if (Array.isArray(value)) return value.map(function (v) { return canonicalize_(v, ignoredFields); });
   const out = {};
   for (const key of Object.keys(value).sort()) {
-    if (FINGERPRINT_IGNORED_FIELDS.indexOf(key) >= 0) continue;
-    out[key] = canonicalize_(value[key]);
+    if (ignoredFields.indexOf(key) >= 0) continue;
+    out[key] = canonicalize_(value[key], ignoredFields);
   }
   return out;
 }
 
 /**
- * 保存済みの指紋。`[[イベントID, 中身の指紋, 文面の指紋?], ...]` の新しい順。
- * 文面の指紋はシリーズ本体にだけ付く。読めなければ空（＝何も落とさない）
+ * 保存済みの指紋。`[[イベントID, 中身の指紋, 管理情報を除いた指紋?], ...]` の新しい順。
+ * 3つめはシリーズ本体にだけ付く。読めなければ空（＝何も落とさない）
  */
 function readSeenEvents_(props, calendarId) {
   const raw = props.getProperty(seenEventsKey_(calendarId));
@@ -304,14 +315,15 @@ function readSeenEvents_(props, calendarId) {
 
 function toFingerprintMaps_(entries) {
   const content = Object.create(null);
-  const message = Object.create(null);
+  const semantic = Object.create(null);
   for (const entry of entries) {
     if (!Array.isArray(entry) || entry.length < 2 || !entry[0]) continue;
     if (content[entry[0]] !== undefined) continue;
     content[entry[0]] = entry[1];
-    if (entry[2]) message[entry[0]] = entry[2];
+    // 3要素目が無い（#7 が保存した旧形式）ときは引き当てない＝抑止しない
+    if (entry[2]) semantic[entry[0]] = entry[2];
   }
-  return { content: content, message: message };
+  return { content: content, semantic: semantic };
 }
 
 /**
@@ -327,9 +339,9 @@ function writeSeenEvents_(props, calendarId, previous, events) {
     entries.push(entry);
   };
   for (const ev of events) {
-    // 文面の指紋を持つのはシリーズ本体だけ。回の変更に伴う本体を黙らせるのに使う
+    // 管理情報を除いた指紋を持つのはシリーズ本体だけ。回の変更に伴う本体を黙らせるのに使う
     push(ev.recurrence
-      ? [ev.id, eventFingerprint_(ev), messageFingerprint_(calendarId, ev)]
+      ? [ev.id, eventFingerprint_(ev), semanticFingerprint_(ev)]
       : [ev.id, eventFingerprint_(ev)]);
   }
   for (const entry of previous) {

@@ -87,6 +87,63 @@ test('シリーズ本体そのものの変更は、同じ差分に回が居て�
   assert.ok(second.posts.some((p) => p.includes('ごはん（改）') && p.startsWith('✏️')));
 });
 
+test('シリーズ本体のリマインダー変更は、同じ差分に回が居ても通知する', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  // 文面（タイトル・日時・種別）には出ない変更。updated も進まない
+  const remindersChanged = {
+    ...seriesA,
+    reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 30 }] },
+  };
+  const second = calendar.run({
+    items: [
+      remindersChanged,
+      cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+    ],
+  });
+
+  assert.equal(second.posts.length, 2, 'シリーズ本体の変更が握りつぶされてはいけない');
+  assert.ok(second.posts.some((p) => p.includes('（繰り返し予定）')));
+});
+
+test('繰り返しルール・終了日時だけの変更も、同じ差分に回が居ても通知する', () => {
+  for (const [name, change] of [
+    ['recurrence', { recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=WE;UNTIL=20270101T000000Z'] }],
+    ['end', { end: { dateTime: '2021-05-26T21:00:00+09:00' } }],
+  ]) {
+    const calendar = createSyncedCalendar();
+    calendar.run({ items: [seriesA] });
+
+    const second = calendar.run({
+      items: [
+        { ...seriesA, ...change, updated: '2026-08-15T00:06:00Z', sequence: 3 },
+        cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+      ],
+    });
+
+    assert.equal(second.posts.length, 2, name + ' の変更が握りつぶされてはいけない');
+  }
+});
+
+test('旧2要素形式のキャッシュしか無ければ、シリーズ本体を黙らせない', () => {
+  // #7 が保存した形式。管理情報を除いた指紋がまだ無い
+  const calendar = createSyncedCalendar({
+    properties: { [SEEN_KEY]: JSON.stringify([['A', '0123456789abcdef']]) },
+  });
+
+  const result = calendar.run({
+    items: [
+      { ...seriesA, updated: '2026-08-15T00:06:00Z', sequence: 3 },
+      cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+    ],
+  });
+
+  assert.equal(result.posts.length, 2);
+  // 今回の実行で3要素に書き直され、次からは黙らせられる
+  assert.equal(JSON.parse(calendar.property(SEEN_KEY))[0].length, 3);
+});
+
 test('通知する回が無ければ、シリーズ本体は黙らせない', () => {
   const calendar = createSyncedCalendar();
   calendar.run({ items: [seriesA] });
