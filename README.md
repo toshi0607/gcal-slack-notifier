@@ -125,7 +125,21 @@ gh variable set CLASP_SCRIPT_ID --body "$(node -p "require('./.clasp.json').scri
 | `CLASP_CREDENTIALS` | シークレット | `~/.clasprc.json` の中身（GoogleのOAuthリフレッシュトークン） |
 | `CLASP_SCRIPT_ID` | 変数 | GASプロジェクトのスクリプトID |
 
-`CLASP_CREDENTIALS` はGoogleアカウントに対する強い権限を持つ。Settings → Environments でデプロイ用のEnvironmentを作り、`deploy` ジョブに `environment:` を足して必須レビュアーを設定すると、マージから配信までの間に承認を挟める。
+### 実行できる人を絞る
+
+手動実行（Run workflow）には**リポジトリへのwrite権限が必要**なので、閲覧者が勝手にデプロイすることはできない。ただし `workflow_dispatch` は実行するブランチを選べるため、write権限を持つ人はmain以外のブランチの `src/` を本番へ送れてしまう。
+
+これを塞ぐため、`deploy` ジョブは `environment: gas` を参照している。Settings → Environments で `gas` に保護ルールを設定する。
+
+| 設定 | 効果 |
+|---|---|
+| Deployment branches | `main` のみに制限し、別ブランチからの手動実行を止める |
+| Required reviewers | 手動実行・マージの両方で、デプロイ前に承認を挟む |
+| Environment secrets | `CLASP_CREDENTIALS` をここに置くと、このEnvironmentを使うジョブ以外から読めなくなる |
+
+Environmentは参照された時点で自動作成されるため、未設定のフォークでもワークフローは壊れない（その場合は保護なしで動く）。Environmentの保護ルールはpublicリポジトリならFreeプランでも使える。
+
+ワークフローに `if: github.actor == '...'` を書く方法もあるが、write権限があればワークフロー自体を書き換えられるので、権限の境界としては機能しない。
 
 ### 注意
 

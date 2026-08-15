@@ -24,6 +24,12 @@ jobs:
     # secrets は if で参照できないため、有効化の判定は変数側で行う。
     if: vars.CLASP_SCRIPT_ID != ''
     runs-on: ubuntu-latest
+    # Settings → Environments で保護ルールを設定する前提。未設定でも自動作成されるので
+    # フォーク側が壊れることはないが、その場合は保護なしで動く。
+    #   - Deployment branches: main のみ（別ブランチからの手動実行を止める）
+    #   - Required reviewers: デプロイ前に承認を挟む
+    #   - CLASP_CREDENTIALS をこの Environment のシークレットにすると、他のジョブから読めなくなる
+    environment: gas
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
