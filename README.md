@@ -101,6 +101,54 @@ npm run push    # GASへデプロイ
 npm run pull    # GAS側の変更を取り込む
 ```
 
+## デプロイ（GitHub Actions）
+
+`.github/workflows/deploy.yml` が、**手動実行**（Actions タブの Run workflow）と **main への push**（PR マージ）で `clasp push` を実行する。`src/**` を変更していないマージではデプロイしない（手動実行なら常に走る）。デプロイ前に `npm run check` が通ることを確認し、失敗したら push しない。
+
+このリポジトリは public で、フォークして各自のGASプロジェクトへ配信する使い方を想定しているため、次の方針を採っている。
+
+- **`pull_request` では動かさない。** 誰でもPRを出せるため、PRのコードを実行する経路に認証情報を渡すとトークンを盗まれる。デプロイの起点は main への push と手動実行だけにしている
+- **未設定のフォークではジョブごとスキップする。** 変数 `CLASP_SCRIPT_ID` が空ならジョブが起動しないので、設定していない人のActionsが赤くならない
+- **scriptIdは各自のもの。** `.clasp.json` はコミットせず、CI実行時に変数から生成する
+
+### 有効化の手順
+
+自分のリポジトリ（フォーク含む）で有効にするには、ローカルで `npm run login` と `.clasp.json` の用意を済ませたうえで、以下を設定する。
+
+```bash
+gh secret set CLASP_CREDENTIALS < ~/.clasprc.json
+gh variable set CLASP_SCRIPT_ID --body "$(node -p "require('./.clasp.json').scriptId")"
+```
+
+| 名前 | 種別 | 中身 |
+|---|---|---|
+| `CLASP_CREDENTIALS` | シークレット | `~/.clasprc.json` の中身（GoogleのOAuthリフレッシュトークン） |
+| `CLASP_SCRIPT_ID` | 変数 | GASプロジェクトのスクリプトID |
+
+### 実行できる人を絞る
+
+手動実行（Run workflow）には**リポジトリへのwrite権限が必要**なので、閲覧者が勝手にデプロイすることはできない。ただし `workflow_dispatch` は実行するブランチを選べるため、write権限を持つ人はmain以外のブランチの `src/` を本番へ送れてしまう。
+
+これを塞ぐため、`deploy` ジョブは `environment: gas` を参照している。Settings → Environments で `gas` に保護ルールを設定する。
+
+| 設定 | 効果 |
+|---|---|
+| Deployment branches | `main` のみに制限し、別ブランチからの手動実行を止める |
+| Required reviewers | 手動実行・マージの両方で、デプロイ前に承認を挟む |
+| Environment secrets | `CLASP_CREDENTIALS` をここに置くと、このEnvironmentを使うジョブ以外から読めなくなる |
+
+Environmentは参照された時点で自動作成されるため、未設定のフォークでもワークフローは壊れない（その場合は保護なしで動く）。Environmentの保護ルールはpublicリポジトリならFreeプランでも使える。
+
+ワークフローに `if: github.actor == '...'` を書く方法もあるが、write権限があればワークフロー自体を書き換えられるので、権限の境界としては機能しない。
+
+### 注意
+
+- ワークフローは `clasp push --force` を使う。CIのように端末を持たない環境では、`appsscript.json` に差分があると clasp が確認を取れず「Skipping push.」と表示して**終了コード0のまま何もデプロイしない**ため。副作用として、**GASエディタ側で `appsscript.json` を編集していると上書きされる**。マニフェストはこのリポジトリを正とする
+- 認証は `clasp login` で作られるリフレッシュトークンをそのまま使う。サービスアカウント（`--adc`）は clasp 側が「EXPERIMENTAL/NOT WORKING」と明記しているので使わない
+- 自前のOAuthクライアント（`clasp login --creds`）で作ったトークンを使う場合、OAuth同意画面が「テスト」のままだとリフレッシュトークンが7日で失効し、1週間後に突然CIが落ちる。素の `clasp login` なら起きない
+- 時間主導トリガーはヘッドのコードを実行するため、`clasp push` だけで反映される（バージョン付きデプロイの作成は不要）
+- スクリプト プロパティ（Webhook URL・カレンダーID）はデプロイ対象外。GASエディタ側の設定はpushで消えない
+
 ## 注意
 
 - Webhook URL とカレンダーIDはコードに書かず、スクリプト プロパティに置く
