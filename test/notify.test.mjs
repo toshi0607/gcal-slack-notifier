@@ -51,6 +51,150 @@ test('巻き添えの再送は、前回と中身が同じなら通知しない',
   assert.match(second.posts[0], /2026-09-09T19:30:00\+09:00（繰り返しのうち1回）/);
 });
 
+test('回を削除したときに一緒に返ってくるシリーズ本体は通知しない', () => {
+  const calendar = createSyncedCalendar();
+  const gym = { ...series('G', '2025-01-15T09:00:00+09:00', '2026-06-01T00:00:00Z'), summary: '🐸ジム' };
+
+  // 1回目: 本体は初見なので通知され、ここで管理情報を除いた指紋が残る
+  const first = calendar.run({ items: [gym, seriesA] });
+  assert.equal(first.posts.length, 2);
+
+  // 2回目: 8/19 の回を削除する。本体は updated と sequence だけが動く
+  const touched = (s) => ({ ...s, updated: '2026-08-15T00:06:00Z', sequence: 3 });
+  const second = calendar.run({
+    items: [
+      touched(gym),
+      cancelledOccurrence('G_20260819', 'G', '2026-08-19T09:00:00+09:00', '2026-08-15T00:06:00Z'),
+      touched(seriesA),
+      cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+    ],
+  });
+
+  assert.deepEqual(headlines(second.posts), ['🗑️ 予定が削除されました', '🗑️ 予定が削除されました']);
+  assert.ok(second.posts.every((p) => p.includes('2026-08-19')));
+});
+
+test('シリーズ本体そのものの変更は、同じ差分に回が居ても通知する', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  const renamed = { ...seriesA, summary: 'ごはん（改）', updated: '2026-08-15T00:06:00Z' };
+  const second = calendar.run({
+    items: [renamed, cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z')],
+  });
+
+  assert.equal(second.posts.length, 2);
+  assert.ok(second.posts.some((p) => p.includes('ごはん（改）') && p.startsWith('✏️')));
+});
+
+test('シリーズ本体のリマインダー変更は、同じ差分に回が居ても通知する', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  // 文面（タイトル・日時・種別）には出ない変更。updated も進まない
+  const remindersChanged = {
+    ...seriesA,
+    reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 30 }] },
+  };
+  const second = calendar.run({
+    items: [
+      remindersChanged,
+      cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+    ],
+  });
+
+  assert.equal(second.posts.length, 2, 'シリーズ本体の変更が握りつぶされてはいけない');
+  assert.ok(second.posts.some((p) => p.includes('（繰り返し予定）')));
+});
+
+test('extendedProperties の updated / sequence の変更は通知する（管理情報扱いしない）', () => {
+  for (const key of ['updated', 'sequence']) {
+    const withProperties = {
+      ...seriesA,
+      extendedProperties: { private: { [key]: '1', memo: 'そのまま' } },
+    };
+    const calendar = createSyncedCalendar();
+    calendar.run({ items: [withProperties] });
+
+    // 動かすのは extendedProperties の中だけ。トップレベルの updated / sequence は据え置き
+    const second = calendar.run({
+      items: [
+        { ...withProperties, extendedProperties: { private: { [key]: '2', memo: 'そのまま' } } },
+        cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+      ],
+    });
+
+    assert.equal(second.posts.length, 2,
+      'extendedProperties.private.' + key + ' の変更が握りつぶされてはいけない');
+  }
+});
+
+test('繰り返しルール・終了日時だけの変更も、同じ差分に回が居ても通知する', () => {
+  for (const [name, change] of [
+    ['recurrence', { recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=WE;UNTIL=20270101T000000Z'] }],
+    ['end', { end: { dateTime: '2021-05-26T21:00:00+09:00' } }],
+  ]) {
+    const calendar = createSyncedCalendar();
+    calendar.run({ items: [seriesA] });
+
+    const second = calendar.run({
+      items: [
+        { ...seriesA, ...change, updated: '2026-08-15T00:06:00Z', sequence: 3 },
+        cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+      ],
+    });
+
+    assert.equal(second.posts.length, 2, name + ' の変更が握りつぶされてはいけない');
+  }
+});
+
+test('旧2要素形式のキャッシュしか無ければ、シリーズ本体を黙らせない', () => {
+  // #7 が保存した形式。管理情報を除いた指紋がまだ無い
+  const calendar = createSyncedCalendar({
+    properties: { [SEEN_KEY]: JSON.stringify([['A', '0123456789abcdef']]) },
+  });
+
+  const result = calendar.run({
+    items: [
+      { ...seriesA, updated: '2026-08-15T00:06:00Z', sequence: 3 },
+      cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+    ],
+  });
+
+  assert.equal(result.posts.length, 2);
+  // 今回の実行で3要素に書き直され、次からは黙らせられる
+  assert.equal(JSON.parse(calendar.property(SEEN_KEY))[0].length, 3);
+});
+
+test('通知する回が無ければ、シリーズ本体は黙らせない', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  // 差分に乗った回が過去回だけなら、本体の通知が唯一の知らせになる
+  const second = calendar.run({
+    items: [
+      { ...seriesA, updated: '2026-08-15T00:06:00Z', sequence: 3 },
+      cancelledOccurrence('A_20260701', 'A', '2026-07-01T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+    ],
+  });
+
+  assert.deepEqual(headlines(second.posts), ['✏️ 予定が更新されました']);
+});
+
+test('シリーズ全体を削除したら本体の削除を通知する', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  const second = calendar.run({
+    items: [
+      { ...seriesA, status: 'cancelled', updated: '2026-08-15T00:06:00Z' },
+      cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+    ],
+  });
+
+  assert.ok(second.posts.some((p) => p.startsWith('🗑️') && p.includes('繰り返し予定')));
+});
+
 test('リマインダーだけの変更は通知する（updated が進まないケース）', () => {
   const calendar = createSyncedCalendar();
   calendar.run({ items: [single] });
