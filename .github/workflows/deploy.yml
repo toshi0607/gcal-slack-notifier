@@ -1,0 +1,60 @@
+name: Deploy
+
+# 手動実行と、main への push（PR マージ）で GAS へデプロイする。
+# pull_request では絶対に動かさない。public リポジトリでは誰でも PR を出せるため、
+# PR のコードを実行する経路に認証情報を渡すとトークンを盗まれる。
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - '.github/workflows/deploy.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-gas
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # 変数 CLASP_SCRIPT_ID が未設定のフォークではジョブごとスキップする。
+    # secrets は if で参照できないため、有効化の判定は変数側で行う。
+    if: vars.CLASP_SCRIPT_ID != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run check
+
+      - name: 認証情報を配置
+        env:
+          CLASP_CREDENTIALS: ${{ secrets.CLASP_CREDENTIALS }}
+          SCRIPT_ID: ${{ vars.CLASP_SCRIPT_ID }}
+        run: |
+          if [ -z "$CLASP_CREDENTIALS" ]; then
+            echo "::error::変数 CLASP_SCRIPT_ID は設定されていますが、シークレット CLASP_CREDENTIALS がありません"
+            exit 1
+          fi
+          # clasp はアクセストークンを更新するとこのファイルを書き戻すため、書き込み可能にしておく。
+          # --auth / clasp_config_auth は clasp 3.x で deprecated なので既定パスをそのまま使う。
+          printf '%s' "$CLASP_CREDENTIALS" > "$HOME/.clasprc.json"
+          chmod 600 "$HOME/.clasprc.json"
+          # 失敗時に中身をログへ出さないよう、パースエラーは握って汎用メッセージにする
+          node -e 'try { JSON.parse(require("fs").readFileSync(process.env.HOME + "/.clasprc.json", "utf8")) } catch { console.error("::error::CLASP_CREDENTIALS が JSON として不正です"); process.exit(1) }'
+          node -e 'require("fs").writeFileSync(".clasp.json", JSON.stringify({ scriptId: process.env.SCRIPT_ID, rootDir: "src" }))'
+
+      # --force は必須。非TTYで appsscript.json に差分があると、clasp は確認プロンプトを
+      # 出せずに "Skipping push." と表示して終了コード0で終わる（何もデプロイされないまま緑になる）。
+      - name: GAS へ push
+        run: npx clasp push --force
+
+      - name: 認証情報を削除
+        if: always()
+        run: rm -f "$HOME/.clasprc.json" .clasp.json
