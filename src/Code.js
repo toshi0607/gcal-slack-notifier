@@ -32,7 +32,9 @@ const SEEN_EVENTS_MAX_BYTES = 8000;
 const FINGERPRINT_IGNORED_FIELDS = ['etag', 'kind', 'htmlLink'];
 
 // 回を操作したときにシリーズ本体側で動く管理情報。
-// 「本体そのものは変わっていない」を見分けるときだけ、上に加えて無視する
+// 「本体そのものは変わっていない」を見分けるときだけ、上に加えて無視する。
+// 無視するのはイベント直下のみ。`extendedProperties` などに同名のキーを置けるため、
+// 深い階層まで落とすと利用者が入れた値の変更を見落とす
 const BOOKKEEPING_FIELDS = ['updated', 'sequence'];
 
 function getConfig_() {
@@ -270,9 +272,18 @@ function eventFingerprint_(ev) {
  * 管理情報（`BOOKKEEPING_FIELDS`）を除いた指紋。
  * 「回を操作したせいで乗っただけか、本体そのものが変わったか」を見分けるのに使う。
  * リマインダー・繰り返しルール・終了日時・場所・説明・参加者の変更はここに出る。
+ *
+ * 管理情報を落とすのはイベント直下だけ。浅いコピーから消してから正規化する
+ * （`canonicalize_()` は再帰的に落とすため、そのまま渡すと
+ * `extendedProperties.private.updated` のような利用者の値まで消えてしまう）。
  */
 function semanticFingerprint_(ev) {
-  return digest_(JSON.stringify(canonicalize_(ev, FINGERPRINT_IGNORED_FIELDS.concat(BOOKKEEPING_FIELDS))));
+  const withoutBookkeeping = {};
+  for (const key of Object.keys(ev)) {
+    if (BOOKKEEPING_FIELDS.indexOf(key) >= 0) continue;
+    withoutBookkeeping[key] = ev[key];
+  }
+  return digest_(JSON.stringify(canonicalize_(withoutBookkeeping, FINGERPRINT_IGNORED_FIELDS)));
 }
 
 function digest_(text) {

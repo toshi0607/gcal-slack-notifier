@@ -55,7 +55,7 @@ test('回を削除したときに一緒に返ってくるシリーズ本体は�
   const calendar = createSyncedCalendar();
   const gym = { ...series('G', '2025-01-15T09:00:00+09:00', '2026-06-01T00:00:00Z'), summary: '🐸ジム' };
 
-  // 1回目: 本体は初見なので通知され、ここで文面の指紋が残る
+  // 1回目: 本体は初見なので通知され、ここで管理情報を除いた指紋が残る
   const first = calendar.run({ items: [gym, seriesA] });
   assert.equal(first.posts.length, 2);
 
@@ -105,6 +105,28 @@ test('シリーズ本体のリマインダー変更は、同じ差分に回が�
 
   assert.equal(second.posts.length, 2, 'シリーズ本体の変更が握りつぶされてはいけない');
   assert.ok(second.posts.some((p) => p.includes('（繰り返し予定）')));
+});
+
+test('extendedProperties の updated / sequence の変更は通知する（管理情報扱いしない）', () => {
+  for (const key of ['updated', 'sequence']) {
+    const withProperties = {
+      ...seriesA,
+      extendedProperties: { private: { [key]: '1', memo: 'そのまま' } },
+    };
+    const calendar = createSyncedCalendar();
+    calendar.run({ items: [withProperties] });
+
+    // 動かすのは extendedProperties の中だけ。トップレベルの updated / sequence は据え置き
+    const second = calendar.run({
+      items: [
+        { ...withProperties, extendedProperties: { private: { [key]: '2', memo: 'そのまま' } } },
+        cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z'),
+      ],
+    });
+
+    assert.equal(second.posts.length, 2,
+      'extendedProperties.private.' + key + ' の変更が握りつぶされてはいけない');
+  }
 });
 
 test('繰り返しルール・終了日時だけの変更も、同じ差分に回が居ても通知する', () => {
