@@ -69,10 +69,89 @@ function initialize() {
   const config = getConfig_();
   const props = PropertiesService.getScriptProperties();
   for (const calendarId of config.calendarIds) {
-    props.setProperty(syncTokenKey_(calendarId), fetchInitialSyncToken_(calendarId));
+    createBaseline_(props, calendarId);
   }
   props.deleteProperty(PROP_LEGACY_SYNC_TOKEN);
   console.log('初期化完了: ' + config.calendarIds.length + '件のカレンダー');
+}
+
+/**
+ * 手動実行: いまカレンダーにある予定の指紋をまとめて記録する（通知は出さない）。
+ *
+ * 指紋が無いイベントは「変わっていない」と確認できないので通知する。
+ * つまり何もしなければ、シリーズごとに1回は巻き添えの通知が出てから静かになる。
+ * これを先に埋めておけば、最初の1回から抑止が効く。
+ *
+ * `syncToken` は進めないが、**まだ通知していない差分に含まれるイベントは記録しない**。
+ * 記録してしまうと、次の定期実行がその差分を受け取ったときに
+ * 「前回見たときと同じ」と判定して、通知すべき変更を消してしまう。
+ *
+ * そのため順序が重要:
+ *   1. フル同期で現在の一覧を取る
+ *   2. 保存済み `syncToken` から未取得の差分を全ページ取る（`syncToken` は更新しない）
+ *   3. 差分に居たイベントを一覧から外す
+ *   4. 残りだけを記録する
+ *
+ * 1 のあとに 2 を取るので、その間に入った変更も差分側に現れて記録対象から外れる。
+ */
+function primeFingerprints() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(0)) {
+    throw new Error('定期実行が動いているため中止しました。しばらく待ってから実行し直してください');
+  }
+  try {
+    const config = getConfig_();
+    const props = PropertiesService.getScriptProperties();
+    for (const calendarId of config.calendarIds) {
+      const events = fullSync_(calendarId).items;
+      const pending = pendingChangedIds_(props, calendarId);
+      const recordable = events.filter(function (ev) { return !pending[ev.id]; });
+      writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), recordable);
+      const held = events.length - recordable.length;
+      console.log(calendarId + ': ' + recordable.length + '件の予定から指紋を記録しました'
+        + (held > 0 ? '（未通知の差分にある ' + held + '件は次の定期実行に譲るため記録せず）' : ''));
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 保存済み `syncToken` から、まだ通知していない差分に含まれるイベントIDを集める。
+ * `syncToken` は進めない — その差分を通知するのは次の定期実行の仕事。
+ *
+ * 取得に失敗したら例外にして、指紋を1件も書かずに終わる。どのイベントが未通知か
+ * 分からないまま記録すると、通知が消える側に倒れるため（失効した `syncToken` も同様。
+ * その場合は次の定期実行が基準点を作り直し、そこで指紋も記録される）。
+ */
+function pendingChangedIds_(props, calendarId) {
+  const ids = Object.create(null);
+  const syncToken = props.getProperty(syncTokenKey_(calendarId));
+  if (!syncToken) return ids;  // 基準点がまだ無い。次の定期実行が作る
+  let pageToken;
+  do {
+    const res = Calendar.Events.list(calendarId, {
+      syncToken: syncToken,
+      singleEvents: SINGLE_EVENTS,
+      showDeleted: true,
+      pageToken: pageToken,
+    });
+    for (const ev of (res.items || [])) {
+      if (ev.id) ids[ev.id] = true;
+    }
+    pageToken = res.nextPageToken;
+  } while (pageToken);
+  return ids;
+}
+
+/**
+ * 現時点を差分の基点にする。フル同期で得た予定の指紋も一緒に記録して、
+ * 基点を作り直した直後に巻き添えの通知が噴き出すのを防ぐ。
+ */
+function createBaseline_(props, calendarId) {
+  const result = fullSync_(calendarId);
+  props.setProperty(syncTokenKey_(calendarId), result.syncToken);
+  writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), result.items);
 }
 
 /**
@@ -125,7 +204,7 @@ function notifyOneCalendar_(props, config, calendarId) {
   const tokenKey = syncTokenKey_(calendarId);
   let syncToken = props.getProperty(tokenKey);
   if (!syncToken) {
-    props.setProperty(syncTokenKey_(calendarId), fetchInitialSyncToken_(calendarId));
+    createBaseline_(props, calendarId);
     console.log(calendarId + ': 基準点を作成しました（通知なし）');
     return 0;
   }
@@ -151,7 +230,7 @@ function notifyOneCalendar_(props, config, calendarId) {
     // それ以外（一時的なエラー・クォータ超過など）は再スローし、GASの失敗通知メールに載せる
     if (!isSyncTokenExpired_(e)) throw e;
     console.warn(calendarId + ': syncToken失効のため基準点を取り直します: ' + e);
-    props.setProperty(syncTokenKey_(calendarId), fetchInitialSyncToken_(calendarId));
+    createBaseline_(props, calendarId);
     return 0;
   }
   props.setProperty(tokenKey, syncToken);
@@ -394,8 +473,14 @@ function toCalendarDate_(value) {
   return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
 }
 
-function fetchInitialSyncToken_(calendarId) {
+/**
+ * 現時点を基点にフル同期して `{ items, syncToken }` を返す。
+ * `items` は指紋の記録に使う。再送の常連である繰り返し予定を先に並べ、
+ * 保存の枠が足りないときにそちらが残るようにする。
+ */
+function fullSync_(calendarId) {
   let pageToken, syncToken;
+  const items = [];
   do {
     const res = Calendar.Events.list(calendarId, {
       timeMin: new Date().toISOString(),
@@ -403,13 +488,20 @@ function fetchInitialSyncToken_(calendarId) {
       showDeleted: true,
       pageToken: pageToken,
     });
+    items.push(...(res.items || []));
     pageToken = res.nextPageToken;
     if (res.nextSyncToken) syncToken = res.nextSyncToken;
   } while (pageToken);
   if (!syncToken) {
     throw new Error(calendarId + ': nextSyncToken を取得できませんでした。カレンダーIDと権限を確認してください');
   }
-  return syncToken;
+  const recurring = items.filter(isRecurringRelated_);
+  return { items: recurring.concat(items.filter(function (ev) { return !isRecurringRelated_(ev); })), syncToken: syncToken };
+}
+
+/** 繰り返し予定のシリーズ本体か、その1回か */
+function isRecurringRelated_(ev) {
+  return !!(ev.recurrence || ev.recurringEventId);
 }
 
 function isSyncTokenExpired_(e) {
