@@ -69,10 +69,39 @@ function initialize() {
   const config = getConfig_();
   const props = PropertiesService.getScriptProperties();
   for (const calendarId of config.calendarIds) {
-    props.setProperty(syncTokenKey_(calendarId), fetchInitialSyncToken_(calendarId));
+    createBaseline_(props, calendarId);
   }
   props.deleteProperty(PROP_LEGACY_SYNC_TOKEN);
   console.log('初期化完了: ' + config.calendarIds.length + '件のカレンダー');
+}
+
+/**
+ * 手動実行: いまカレンダーにある予定の指紋をまとめて記録する（通知は出さない）。
+ *
+ * 指紋が無いイベントは「変わっていない」と確認できないので通知する。
+ * つまり何もしなければ、シリーズごとに1回は巻き添えの通知が出てから静かになる。
+ * これを先に埋めておけば、最初の1回から抑止が効く。
+ *
+ * `syncToken` は触らないので、実行しても差分を取りこぼさない。何度実行してもよい。
+ */
+function primeFingerprints() {
+  const config = getConfig_();
+  const props = PropertiesService.getScriptProperties();
+  for (const calendarId of config.calendarIds) {
+    const events = fullSync_(calendarId).items;
+    writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), events);
+    console.log(calendarId + ': ' + events.length + '件の予定から指紋を記録しました');
+  }
+}
+
+/**
+ * 現時点を差分の基点にする。フル同期で得た予定の指紋も一緒に記録して、
+ * 基点を作り直した直後に巻き添えの通知が噴き出すのを防ぐ。
+ */
+function createBaseline_(props, calendarId) {
+  const result = fullSync_(calendarId);
+  props.setProperty(syncTokenKey_(calendarId), result.syncToken);
+  writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), result.items);
 }
 
 /**
@@ -125,7 +154,7 @@ function notifyOneCalendar_(props, config, calendarId) {
   const tokenKey = syncTokenKey_(calendarId);
   let syncToken = props.getProperty(tokenKey);
   if (!syncToken) {
-    props.setProperty(syncTokenKey_(calendarId), fetchInitialSyncToken_(calendarId));
+    createBaseline_(props, calendarId);
     console.log(calendarId + ': 基準点を作成しました（通知なし）');
     return 0;
   }
@@ -151,7 +180,7 @@ function notifyOneCalendar_(props, config, calendarId) {
     // それ以外（一時的なエラー・クォータ超過など）は再スローし、GASの失敗通知メールに載せる
     if (!isSyncTokenExpired_(e)) throw e;
     console.warn(calendarId + ': syncToken失効のため基準点を取り直します: ' + e);
-    props.setProperty(syncTokenKey_(calendarId), fetchInitialSyncToken_(calendarId));
+    createBaseline_(props, calendarId);
     return 0;
   }
   props.setProperty(tokenKey, syncToken);
@@ -394,8 +423,14 @@ function toCalendarDate_(value) {
   return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
 }
 
-function fetchInitialSyncToken_(calendarId) {
+/**
+ * 現時点を基点にフル同期して `{ items, syncToken }` を返す。
+ * `items` は指紋の記録に使う。再送の常連である繰り返し予定を先に並べ、
+ * 保存の枠が足りないときにそちらが残るようにする。
+ */
+function fullSync_(calendarId) {
   let pageToken, syncToken;
+  const items = [];
   do {
     const res = Calendar.Events.list(calendarId, {
       timeMin: new Date().toISOString(),
@@ -403,13 +438,20 @@ function fetchInitialSyncToken_(calendarId) {
       showDeleted: true,
       pageToken: pageToken,
     });
+    items.push(...(res.items || []));
     pageToken = res.nextPageToken;
     if (res.nextSyncToken) syncToken = res.nextSyncToken;
   } while (pageToken);
   if (!syncToken) {
     throw new Error(calendarId + ': nextSyncToken を取得できませんでした。カレンダーIDと権限を確認してください');
   }
-  return syncToken;
+  const recurring = items.filter(isRecurringRelated_);
+  return { items: recurring.concat(items.filter(function (ev) { return !isRecurringRelated_(ev); })), syncToken: syncToken };
+}
+
+/** 繰り返し予定のシリーズ本体か、その1回か */
+function isRecurringRelated_(ev) {
+  return !!(ev.recurrence || ev.recurringEventId);
 }
 
 function isSyncTokenExpired_(e) {

@@ -70,11 +70,14 @@ sequenceDiagram
 | 関数 | 責務 |
 |---|---|
 | `getConfig_()` | Script Properties から設定値を読み出す。`CALENDAR_ID` はカンマ区切りで複数受け付ける |
-| `initialize()` | 初回のみ手動実行。全カレンダーをフル同期して `syncToken` を保存（通知は出さない） |
+| `initialize()` | 初回のみ手動実行。全カレンダーをフル同期して `syncToken` と指紋を保存（通知は出さない） |
+| `primeFingerprints()` | 手動実行。`syncToken` を触らず、いまある予定の指紋だけを記録する |
+| `createBaseline_()` | フル同期して `syncToken` を保存し、得た予定の指紋も記録する |
 | `notifyCalendarChanges()` | 定期実行。スクリプトロックを取り、カレンダーごとに差分処理する |
 | `notifyOneCalendar_()` | 1カレンダー分の差分取得→判定→Slack投稿→`syncToken` 更新。戻り値は投稿失敗件数 |
 | `migrateLegacySyncToken_()` | 単一カレンダー時代の `SYNC_TOKEN` を `SYNC_TOKEN:<カレンダーID>` へ移す |
-| `fetchInitialSyncToken_()` | 現時点を基点にフル同期して `nextSyncToken` を返す |
+| `fullSync_(calendarId)` | 現時点を基点にフル同期して `{ items, syncToken }` を返す。`items` は繰り返し予定が先 |
+| `isRecurringRelated_(ev)` | シリーズ本体か、その1回かを判定 |
 | `isSyncTokenExpired_(e)` | 例外が `syncToken` 失効（410）由来かを判定 |
 | `formatMessage_(calendarId, ev)` | イベント状態から通知種別（追加/更新/削除）と本文を整形 |
 | `resolveTitle_(calendarId, ev)` | タイトルを解決。削除イベントで `summary` が無ければ親の繰り返し予定から補う |
@@ -133,6 +136,17 @@ sequenceDiagram
 この方式は判定に時刻を使わないため、トリガーの間隔・実行の遅れ・時計のずれのいずれにも影響されない。繰り返し予定の回を続けて何件も消すような、同じイベントが短時間に何度も差分へ乗る操作でも二重通知にならない。
 
 なお、シリーズ本体そのものを変更した場合は本体の指紋が変わるので、従来どおり「✏️ 予定が更新されました」が1件飛ぶ。
+
+#### 指紋の下敷きを先に作る
+
+指紋が無いイベントは落とせないため、何もしなければ**シリーズごとに1回は巻き添えの通知が出てから静かになる**（2026-08-17 に実測: サウナの 8/17 を消したところ、そのシリーズは初見だったためシリーズ本体と過去に消した 11/23 の分も通知された）。監視対象に繰り返し予定がいくつもあると、この空振りが順番に出てくる。
+
+そこで、フル同期のついでに指紋を記録する。
+
+- `initialize()`・新規カレンダーの基準点作成・`syncToken` 失効時の再初期化（すべて `createBaseline_()`）は、`fullSync_()` が返した予定の指紋をそのまま保存する。基準点を取り直した直後に巻き添えが噴き出さない
+- `primeFingerprints()` は `syncToken` を触らずに指紋だけを埋める。すでに動いている環境へこの機能を入れたときに、1回実行すれば最初の変更から抑止が効く。差分を取りこぼさないので何度実行してもよい
+
+保存の枠（`SEEN_EVENTS_MAX_ENTRIES` / `SEEN_EVENTS_MAX_BYTES`）に収まらないときは、`fullSync_()` が繰り返し予定（シリーズ本体とその回）を先に並べて渡す。再送の常連はそちらなので、単発の予定より優先して残す。
 
 ### 回の変更に伴うシリーズ本体の除外
 

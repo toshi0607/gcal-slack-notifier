@@ -90,6 +90,8 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
     run: (options = {}) => evaluate({ ...options, call: 'notifyCalendarChanges' }),
     /** initialize() を1回動かす */
     initialize: (options = {}) => evaluate({ ...options, call: 'initialize' }),
+    /** primeFingerprints() を1回動かす */
+    prime: (options = {}) => evaluate({ ...options, call: 'primeFingerprints' }),
     /** 内部関数を直接呼ぶためのコンテキスト */
     context: () => evaluate({ call: 'getConfig_' }).sandbox,
     property: (key) => (store.has(key) ? store.get(key) : null),

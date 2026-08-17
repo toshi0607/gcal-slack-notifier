@@ -386,3 +386,68 @@ test('指紋は未知のフィールドの変化も拾う', () => {
     context.eventFingerprint_(base),
     context.eventFingerprint_({ ...base, someNewFieldGoogleAdded: 'value' }));
 });
+
+test('primeFingerprints() は通知せず指紋だけ記録し、syncToken を触らない', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.prime({ items: [seriesA, deleted0916] });
+
+  assert.equal(result.posts.length, 0);
+  assert.equal(calendar.property('SYNC_TOKEN:' + CALENDAR_ID), 'tok-0', 'syncToken を進めてはいけない');
+  assert.equal(JSON.parse(calendar.property(SEEN_KEY)).length, 2);
+  assert.ok(result.logs.some((l) => l.includes('2件の予定から指紋を記録しました')));
+});
+
+test('primeFingerprints() 済みなら、最初の削除から余計な通知が出ない', () => {
+  // 2026-08-17 11:26 の実測: サウナの 8/17 を消したら、シリーズ本体と前に消した 11/23 も出た
+  const sauna = { ...series('S', '2025-09-29T20:30:00+09:00', '2026-06-01T00:00:00Z'), summary: 'サウナ' };
+  const deleted1123 = cancelledOccurrence('S_20261123', 'S', '2026-11-23T20:30:00+09:00', '2026-07-20T00:00:00Z');
+
+  const calendar = createSyncedCalendar();
+  calendar.prime({ items: [sauna, deleted1123] });
+
+  const result = calendar.run({
+    items: [
+      { ...sauna, updated: '2026-08-17T02:26:00Z', sequence: 2 },
+      cancelledOccurrence('S_20260817', 'S', '2026-08-17T20:30:00+09:00', '2026-08-17T02:26:00Z'),
+      deleted1123,
+    ],
+  });
+
+  assert.deepEqual(headlines(result.posts), ['🗑️ 予定が削除されました']);
+  assert.match(result.posts[0], /2026-08-17T20:30:00\+09:00/);
+});
+
+test('initialize() もフル同期の結果から指紋を記録する', () => {
+  const calendar = createCalendar();
+  const result = calendar.initialize({ items: [seriesA, deleted0916] });
+
+  assert.equal(result.posts.length, 0);
+  assert.equal(JSON.parse(calendar.property(SEEN_KEY)).length, 2);
+  assert.ok(calendar.property('SYNC_TOKEN:' + CALENDAR_ID));
+});
+
+test('基準点を作り直した直後も巻き添えの通知が噴き出さない', () => {
+  const calendar = createCalendar();  // syncToken が無い状態から始める
+  const first = calendar.run({ items: [seriesA, deleted0916] });
+  assert.equal(first.posts.length, 0, '基準点作成時は通知しない');
+
+  // 続く差分に同じものが乗っても、基準点作成時の指紋で黙る
+  const second = calendar.run({ items: [seriesA, deleted0916, deleted0902] });
+  assert.deepEqual(headlines(second.posts), ['🗑️ 予定が削除されました']);
+  assert.match(second.posts[0], /2026-09-02/);
+});
+
+test('保存の枠が足りないときは繰り返し予定を優先して残す', () => {
+  const calendar = createSyncedCalendar();
+  const singles = [];
+  for (let i = 0; i < 400; i++) {
+    singles.push({ ...single, id: 'single-' + i + '-'.padEnd(40, 'x'), summary: '単発' + i });
+  }
+  // 繰り返し予定は最後に並べて渡す（API の順序に依存しないことの確認）
+  calendar.prime({ items: singles.concat([seriesA, deleted0916]) });
+
+  const stored = JSON.parse(calendar.property(SEEN_KEY)).map((e) => e[0]);
+  assert.ok(stored.includes('A'), 'シリーズ本体が捨てられている');
+  assert.ok(stored.includes('A_20260916'), '繰り返しの回が捨てられている');
+  assert.equal(stored[0], 'A');
+});
