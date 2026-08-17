@@ -34,6 +34,14 @@ const single = {
   reminders: { useDefault: true },
 };
 
+/**
+ * primeFingerprints() 用の応答。フル同期（syncToken なし）と
+ * 未取得の差分（syncToken あり）で別の一覧を返す。
+ */
+const primeSources = (full, pending = []) => (calendarId, params) => (params.syncToken
+  ? { items: pending }
+  : { summary: 'テストカレンダー', items: full, nextSyncToken: 'tok-full' });
+
 test('巻き添えの再送は、前回と中身が同じなら通知しない', () => {
   const calendar = createSyncedCalendar();
 
@@ -389,7 +397,7 @@ test('指紋は未知のフィールドの変化も拾う', () => {
 
 test('primeFingerprints() は通知せず指紋だけ記録し、syncToken を触らない', () => {
   const calendar = createSyncedCalendar();
-  const result = calendar.prime({ items: [seriesA, deleted0916] });
+  const result = calendar.prime({ listImpl: primeSources([seriesA, deleted0916]) });
 
   assert.equal(result.posts.length, 0);
   assert.equal(calendar.property('SYNC_TOKEN:' + CALENDAR_ID), 'tok-0', 'syncToken を進めてはいけない');
@@ -403,7 +411,7 @@ test('primeFingerprints() 済みなら、最初の削除から余計な通知が
   const deleted1123 = cancelledOccurrence('S_20261123', 'S', '2026-11-23T20:30:00+09:00', '2026-07-20T00:00:00Z');
 
   const calendar = createSyncedCalendar();
-  calendar.prime({ items: [sauna, deleted1123] });
+  calendar.prime({ listImpl: primeSources([sauna, deleted1123]) });
 
   const result = calendar.run({
     items: [
@@ -444,10 +452,67 @@ test('保存の枠が足りないときは繰り返し予定を優先して残�
     singles.push({ ...single, id: 'single-' + i + '-'.padEnd(40, 'x'), summary: '単発' + i });
   }
   // 繰り返し予定は最後に並べて渡す（API の順序に依存しないことの確認）
-  calendar.prime({ items: singles.concat([seriesA, deleted0916]) });
+  calendar.prime({ listImpl: primeSources(singles.concat([seriesA, deleted0916])) });
 
   const stored = JSON.parse(calendar.property(SEEN_KEY)).map((e) => e[0]);
   assert.ok(stored.includes('A'), 'シリーズ本体が捨てられている');
   assert.ok(stored.includes('A_20260916'), '繰り返しの回が捨てられている');
   assert.equal(stored[0], 'A');
+});
+
+test('primeFingerprints() は未取得の差分に含まれる予定の指紋を記録しない', () => {
+  const calendar = createSyncedCalendar();
+  // tok-0 を保存したあとに変更された予定。フル同期にも差分にも現れる
+  const changed = { ...single, summary: '変更後', updated: '2026-08-17T12:00:00Z' };
+
+  calendar.prime({ items: [changed] });
+  const result = calendar.run({ items: [changed] });
+
+  assert.equal(result.posts.length, 1, '未通知の変更を握りつぶしてはいけない');
+  assert.match(result.posts[0], /変更後/);
+});
+
+test('primeFingerprints() は未取得の差分に無い予定だけ記録する', () => {
+  const calendar = createSyncedCalendar();
+  const changed = { ...single, summary: '変更後', updated: '2026-08-17T12:00:00Z' };
+
+  const result = calendar.prime({ listImpl: primeSources([seriesA, changed], [changed]) });
+
+  const stored = JSON.parse(calendar.property(SEEN_KEY)).map((e) => e[0]);
+  assert.deepEqual(stored, ['A'], '未通知の差分にある予定を記録してはいけない');
+  assert.ok(result.logs.some((l) => l.includes('未通知の差分にある 1件')));
+
+  // 記録しなかった分は、次の定期実行できちんと通知される
+  const second = calendar.run({ items: [changed] });
+  assert.equal(second.posts.length, 1);
+});
+
+test('未取得の差分を取れなかったら、指紋を書かずにエラーにする', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.prime({
+    listImpl: (calendarId, params) => {
+      if (params.syncToken) throw new Error('Backend Error');
+      return { items: [seriesA], nextSyncToken: 'tok-full' };
+    },
+  });
+
+  assert.ok(result.error, '差分の取得失敗を握りつぶしてはいけない');
+  assert.equal(calendar.property(SEEN_KEY), null, '指紋を書いてはいけない');
+  assert.equal(calendar.property('SYNC_TOKEN:' + CALENDAR_ID), 'tok-0');
+});
+
+test('定期実行と primeFingerprints() は同じロックで排他する', () => {
+  // 定期実行が動いている間に手で primeFingerprints() を叩いた場合
+  const duringNotify = createSyncedCalendar();
+  const primed = duringNotify.prime({ items: [seriesA], lockHeld: true });
+  assert.match(String(primed.error && primed.error.message), /定期実行が動いている/);
+  assert.equal(duringNotify.property(SEEN_KEY), null, '指紋を上書きしてはいけない');
+
+  // primeFingerprints() の最中にトリガーが起動した場合
+  const duringPrime = createSyncedCalendar({ properties: { [SEEN_KEY]: JSON.stringify([['A', 'aaaaaaaaaaaaaaaa']]) } });
+  const ran = duringPrime.run({ items: [seriesA], lockHeld: true });
+  assert.equal(ran.posts.length, 0);
+  assert.equal(ran.error, null);
+  assert.deepEqual(JSON.parse(duringPrime.property(SEEN_KEY)), [['A', 'aaaaaaaaaaaaaaaa']], '指紋を上書きしてはいけない');
+  assert.equal(duringPrime.property('SYNC_TOKEN:' + CALENDAR_ID), 'tok-0', 'syncToken も進めてはいけない');
 });

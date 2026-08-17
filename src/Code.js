@@ -82,16 +82,66 @@ function initialize() {
  * つまり何もしなければ、シリーズごとに1回は巻き添えの通知が出てから静かになる。
  * これを先に埋めておけば、最初の1回から抑止が効く。
  *
- * `syncToken` は触らないので、実行しても差分を取りこぼさない。何度実行してもよい。
+ * `syncToken` は進めないが、**まだ通知していない差分に含まれるイベントは記録しない**。
+ * 記録してしまうと、次の定期実行がその差分を受け取ったときに
+ * 「前回見たときと同じ」と判定して、通知すべき変更を消してしまう。
+ *
+ * そのため順序が重要:
+ *   1. フル同期で現在の一覧を取る
+ *   2. 保存済み `syncToken` から未取得の差分を全ページ取る（`syncToken` は更新しない）
+ *   3. 差分に居たイベントを一覧から外す
+ *   4. 残りだけを記録する
+ *
+ * 1 のあとに 2 を取るので、その間に入った変更も差分側に現れて記録対象から外れる。
  */
 function primeFingerprints() {
-  const config = getConfig_();
-  const props = PropertiesService.getScriptProperties();
-  for (const calendarId of config.calendarIds) {
-    const events = fullSync_(calendarId).items;
-    writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), events);
-    console.log(calendarId + ': ' + events.length + '件の予定から指紋を記録しました');
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(0)) {
+    throw new Error('定期実行が動いているため中止しました。しばらく待ってから実行し直してください');
   }
+  try {
+    const config = getConfig_();
+    const props = PropertiesService.getScriptProperties();
+    for (const calendarId of config.calendarIds) {
+      const events = fullSync_(calendarId).items;
+      const pending = pendingChangedIds_(props, calendarId);
+      const recordable = events.filter(function (ev) { return !pending[ev.id]; });
+      writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), recordable);
+      const held = events.length - recordable.length;
+      console.log(calendarId + ': ' + recordable.length + '件の予定から指紋を記録しました'
+        + (held > 0 ? '（未通知の差分にある ' + held + '件は次の定期実行に譲るため記録せず）' : ''));
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 保存済み `syncToken` から、まだ通知していない差分に含まれるイベントIDを集める。
+ * `syncToken` は進めない — その差分を通知するのは次の定期実行の仕事。
+ *
+ * 取得に失敗したら例外にして、指紋を1件も書かずに終わる。どのイベントが未通知か
+ * 分からないまま記録すると、通知が消える側に倒れるため（失効した `syncToken` も同様。
+ * その場合は次の定期実行が基準点を作り直し、そこで指紋も記録される）。
+ */
+function pendingChangedIds_(props, calendarId) {
+  const ids = Object.create(null);
+  const syncToken = props.getProperty(syncTokenKey_(calendarId));
+  if (!syncToken) return ids;  // 基準点がまだ無い。次の定期実行が作る
+  let pageToken;
+  do {
+    const res = Calendar.Events.list(calendarId, {
+      syncToken: syncToken,
+      singleEvents: SINGLE_EVENTS,
+      showDeleted: true,
+      pageToken: pageToken,
+    });
+    for (const ev of (res.items || [])) {
+      if (ev.id) ids[ev.id] = true;
+    }
+    pageToken = res.nextPageToken;
+  } while (pageToken);
+  return ids;
 }
 
 /**

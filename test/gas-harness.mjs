@@ -27,7 +27,7 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
     deleteProperty: (key) => { store.delete(key); },
   };
 
-  function buildSandbox({ items, listImpl, slackStatus, logs, posts }) {
+  function buildSandbox({ items, listImpl, slackStatus, lockHeld, logs, posts }) {
     let listCalls = 0;
     return {
       console: {
@@ -40,7 +40,8 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
         constructor(...args) { super(...(args.length ? args : [now])); }
       },
       PropertiesService: { getScriptProperties: () => scriptProperties },
-      LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
+      // lockHeld: true で「もう一方が動いている」状況を作る
+      LockService: { getScriptLock: () => ({ tryLock: () => !lockHeld, releaseLock: () => {} }) },
       Calendar: {
         Events: {
           list: (calendarId, params) => {
@@ -70,10 +71,10 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
     };
   }
 
-  function evaluate({ items = [], listImpl, slackStatus = 200, call }) {
+  function evaluate({ items = [], listImpl, slackStatus = 200, lockHeld = false, call }) {
     const logs = [];
     const posts = [];
-    const sandbox = buildSandbox({ items, listImpl, slackStatus, logs, posts });
+    const sandbox = buildSandbox({ items, listImpl, slackStatus, lockHeld, logs, posts });
     vm.createContext(sandbox);
     vm.runInContext(SOURCE, sandbox);
     let error = null;
