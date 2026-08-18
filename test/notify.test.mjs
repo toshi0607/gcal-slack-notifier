@@ -516,3 +516,70 @@ test('定期実行と primeFingerprints() は同じロックで排他する', ()
   assert.deepEqual(JSON.parse(duringPrime.property(SEEN_KEY)), [['A', 'aaaaaaaaaaaaaaaa']], '指紋を上書きしてはいけない');
   assert.equal(duringPrime.property('SYNC_TOKEN:' + CALENDAR_ID), 'tok-0', 'syncToken も進めてはいけない');
 });
+
+/**
+ * 定期実行用の応答。自動の下敷き作成（フル同期）と差分で別の一覧を返す。
+ */
+const runSources = (full, delta) => (calendarId, params) => (params.syncToken
+  ? { summary: 'テストカレンダー', items: delta, nextSyncToken: 'tok-next' }
+  : { summary: 'テストカレンダー', items: full, nextSyncToken: 'tok-full' });
+
+test('下敷きが無いカレンダーは、定期実行が1回だけ自動で作る', () => {
+  const sauna = { ...series('S', '2025-09-29T20:30:00+09:00', '2026-06-01T00:00:00Z'), summary: 'サウナ' };
+  const deleted1123 = cancelledOccurrence('S_20261123', 'S', '2026-11-23T20:30:00+09:00', '2026-07-20T00:00:00Z');
+  const calendar = createSyncedCalendar();
+
+  // 変更が無い回でも、下敷きだけは作られる
+  const first = calendar.run({ listImpl: runSources([sauna, deleted1123], []) });
+  assert.equal(first.posts.length, 0);
+  assert.ok(first.logs.some((l) => l.includes('指紋の下敷きを作成しました（2件）')));
+  assert.ok(calendar.property('FINGERPRINTS_PRIMED_AT:' + CALENDAR_ID));
+
+  // 次に 8/17 を消すと、シリーズ本体も 11/23 も黙る
+  const second = calendar.run({
+    items: [
+      { ...sauna, updated: '2026-08-17T02:26:00Z', sequence: 2 },
+      cancelledOccurrence('S_20260817', 'S', '2026-08-17T20:30:00+09:00', '2026-08-17T02:26:00Z'),
+      deleted1123,
+    ],
+  });
+  assert.deepEqual(headlines(second.posts), ['🗑️ 予定が削除されました']);
+  assert.match(second.posts[0], /2026-08-17T20:30:00\+09:00/);
+});
+
+test('自動の下敷き作成でも、その実行で通知する差分は記録しない', () => {
+  const calendar = createSyncedCalendar();
+  const changed = { ...single, summary: '変更後', updated: '2026-08-17T12:00:00Z' };
+
+  // フル同期には変更後の姿が乗るが、同じ実行の差分にも居るので記録しない
+  const result = calendar.run({ listImpl: runSources([seriesA, changed], [changed]) });
+
+  assert.equal(result.posts.length, 1, '今回通知する変更を先回りで消してはいけない');
+  assert.match(result.posts[0], /変更後/);
+
+  const stored = JSON.parse(calendar.property(SEEN_KEY)).map((e) => e[0]);
+  assert.deepEqual(stored.sort(), ['A', 'S1'], '差分で見た分は通常どおり記録する');
+});
+
+test('下敷きの作成は1カレンダーにつき1回だけ', () => {
+  const calendar = createSyncedCalendar();
+  let fullSyncs = 0;
+  const listImpl = (calendarId, params) => {
+    if (params.syncToken) return { items: [], nextSyncToken: 'tok-next' };
+    fullSyncs++;
+    return { items: [seriesA], nextSyncToken: 'tok-full' };
+  };
+
+  calendar.run({ listImpl });
+  calendar.run({ listImpl });
+  calendar.run({ listImpl });
+
+  assert.equal(fullSyncs, 1, '毎回フル同期してはいけない');
+});
+
+test('基準点の作成でも下敷きのマーカーが立つ', () => {
+  const calendar = createCalendar();  // syncToken が無い状態
+  calendar.run({ items: [seriesA] });
+
+  assert.ok(calendar.property('FINGERPRINTS_PRIMED_AT:' + CALENDAR_ID));
+});
