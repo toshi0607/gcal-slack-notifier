@@ -3,11 +3,13 @@
  *   SLACK_WEBHOOK_URL    Slack Incoming Webhook の URL
  *   SYNC_TOKEN:<カレンダーID>    差分同期用トークン（initialize() が自動で保存する。手動設定不要）
  *   SEEN_EVENTS:<カレンダーID>   直近に見たイベントの指紋（同上）
+ *   FINGERPRINTS_PRIMED_AT:<カレンダーID>  指紋の下敷きを作った時刻（同上）
  *****/
 const PROP_CALENDAR_ID = 'CALENDAR_ID';
 const PROP_SLACK_WEBHOOK_URL = 'SLACK_WEBHOOK_URL';
 const PROP_SYNC_TOKEN_PREFIX = 'SYNC_TOKEN:';
 const PROP_SEEN_EVENTS_PREFIX = 'SEEN_EVENTS:';
+const PROP_PRIMED_AT_PREFIX = 'FINGERPRINTS_PRIMED_AT:';
 
 // 単一カレンダーのみ対応していた頃のキー。移行のためだけに参照する
 const PROP_LEGACY_SYNC_TOKEN = 'SYNC_TOKEN';
@@ -62,6 +64,10 @@ function seenEventsKey_(calendarId) {
   return PROP_SEEN_EVENTS_PREFIX + calendarId;
 }
 
+function primedAtKey_(calendarId) {
+  return PROP_PRIMED_AT_PREFIX + calendarId;
+}
+
 /**
  * 初回のみ手動実行: 各カレンダーの現時点を基点に記録（通知は出さない）
  */
@@ -103,17 +109,37 @@ function primeFingerprints() {
     const config = getConfig_();
     const props = PropertiesService.getScriptProperties();
     for (const calendarId of config.calendarIds) {
-      const events = fullSync_(calendarId).items;
-      const pending = pendingChangedIds_(props, calendarId);
-      const recordable = events.filter(function (ev) { return !pending[ev.id]; });
-      writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), recordable);
-      const held = events.length - recordable.length;
-      console.log(calendarId + ': ' + recordable.length + '件の予定から指紋を記録しました'
-        + (held > 0 ? '（未通知の差分にある ' + held + '件は次の定期実行に譲るため記録せず）' : ''));
+      const snapshot = fullSync_(calendarId).items;
+      const result = primeCalendar_(props, calendarId, snapshot, pendingChangedIds_(props, calendarId));
+      console.log(calendarId + ': ' + result.recorded + '件の予定から指紋を記録しました'
+        + (result.held > 0
+          ? '（未通知の差分にある ' + result.held + '件は次の定期実行に譲るため記録せず）'
+          : ''));
     }
   } finally {
     lock.releaseLock();
   }
+}
+
+/**
+ * フル同期の結果から指紋を記録する。`excludedIds`（＝まだ通知していない差分に居る
+ * イベント）は記録しない。記録すると、その差分を受け取った定期実行が
+ * 「前回見たときと同じ」と判定して通知を消してしまう。
+ */
+function primeCalendar_(props, calendarId, snapshot, excludedIds) {
+  const recordable = snapshot.filter(function (ev) { return !excludedIds[ev.id]; });
+  writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), recordable);
+  props.setProperty(primedAtKey_(calendarId), new Date().toISOString());
+  return { recorded: recordable.length, held: snapshot.length - recordable.length };
+}
+
+/** 差分に含まれるイベントIDを集める */
+function idsOf_(events) {
+  const ids = Object.create(null);
+  for (const ev of events) {
+    if (ev.id) ids[ev.id] = true;
+  }
+  return ids;
 }
 
 /**
@@ -151,7 +177,7 @@ function pendingChangedIds_(props, calendarId) {
 function createBaseline_(props, calendarId) {
   const result = fullSync_(calendarId);
   props.setProperty(syncTokenKey_(calendarId), result.syncToken);
-  writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), result.items);
+  primeCalendar_(props, calendarId, result.items, Object.create(null));
 }
 
 /**
@@ -209,6 +235,12 @@ function notifyOneCalendar_(props, config, calendarId) {
     return 0;
   }
 
+  // 下敷きがまだ無いカレンダーは、この実行で作る。フル同期は差分の取得より**先**に行う。
+  // 後にすると、その間に入った変更が「変更後」の姿で記録され、次の実行で通知が消える
+  const snapshot = props.getProperty(primedAtKey_(calendarId)) === null
+    ? fullSync_(calendarId).items
+    : null;
+
   let pageToken;
   let calendarName = '';
   const changed = [];
@@ -237,7 +269,14 @@ function notifyOneCalendar_(props, config, calendarId) {
 
   const seen = readSeenEvents_(props, calendarId);
   const fingerprints = toFingerprintMaps_(seen);
-  writeSeenEvents_(props, calendarId, seen, changed);
+  if (snapshot) {
+    // 今回通知する差分は記録しない。記録すると、この実行の通知判定より先に
+    // 「変わっていない」ことにしてしまう
+    const primed = primeCalendar_(props, calendarId, snapshot, idsOf_(changed));
+    console.log(calendarId + ': 指紋の下敷きを作成しました（' + primed.recorded + '件）');
+  }
+  // 下敷きを書いたあとの内容に、今回見た分を積み直す
+  writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), changed);
 
   const changedThisTime = changed.filter(function (ev) { return !isUnchangedResend_(ev, fingerprints.content); });
   const resent = changed.length - changedThisTime.length;
