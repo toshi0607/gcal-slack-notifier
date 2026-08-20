@@ -39,10 +39,88 @@ const FINGERPRINT_IGNORED_FIELDS = ['etag', 'kind', 'htmlLink'];
 // 深い階層まで落とすと利用者が入れた値の変更を見落とす
 const BOOKKEEPING_FIELDS = ['updated', 'sequence'];
 
-function getConfig_() {
+// スクリプト プロパティの再試行回数と初回の待ち時間（500ms → 1s → 2s）。
+// "a server error occurred while reading from storage. Error code INTERNAL." は
+// Google側の一時障害で、数百ミリ秒から数秒で復旧することが多い
+const STORAGE_ATTEMPTS = 4;
+const STORAGE_RETRY_BASE_MS = 500;
+
+// 再試行しても直らないと分かっているエラー。載っていないものは一時障害とみなして再試行する。
+// 権限不足・認可切れ・値のサイズ超過・1日あたりの呼び出し上限が該当する。
+//
+// 呼び出し上限は "for one day"（日次）に限る。GASには
+// "Service invoked too many times in a short time: ... Try Utilities.sleep(1000) between calls."
+// という短時間のレート制限もあり、こちらは待てば直る＝再試行する側
+const PERMANENT_STORAGE_ERROR = /permission|authoriz|too large|too many times for one day|quota/i;
+
+/**
+ * スクリプト プロパティの読み書き口。
+ *
+ * 読み取りは `getProperties()` で1回だけまとめて取り、以降はその写しから返す。
+ * 1回の実行で `getProperty()` を何度も叩くと、そのたびに Google 側の一時障害
+ * （`INTERNAL`）を踏む機会が増えるため。書き込みは写しと実体の両方へ即座に通す
+ * （＝書いた値は次の実行を待たずに残る）。
+ *
+ * 写しが実体からずれるのは、実行中に別の実行がプロパティを書き換えたときだけ。
+ * 定期実行と `primeFingerprints()` はロックで排他しているので起こらない。
+ */
+function openStore_() {
   const props = PropertiesService.getScriptProperties();
-  const rawCalendarIds = props.getProperty(PROP_CALENDAR_ID);
-  const webhookUrl = props.getProperty(PROP_SLACK_WEBHOOK_URL);
+  const values = withStorageRetry_('スクリプト プロパティの読み取り', function () {
+    return props.getProperties() || {};
+  });
+  return {
+    get: function (key) {
+      return Object.prototype.hasOwnProperty.call(values, key) ? values[key] : null;
+    },
+    set: function (key, value) {
+      const text = String(value);
+      withStorageRetry_('スクリプト プロパティ ' + key + ' の保存', function () {
+        props.setProperty(key, text);
+      });
+      values[key] = text;
+    },
+    remove: function (key) {
+      withStorageRetry_('スクリプト プロパティ ' + key + ' の削除', function () {
+        props.deleteProperty(key);
+      });
+      delete values[key];
+    },
+  };
+}
+
+/**
+ * スクリプト プロパティの操作を、指数バックオフ付きで再試行する。
+ * 読み取り・書き込み・削除はいずれも冪等なので、再試行そのものは安全に行える。
+ *
+ * 判定を「一時障害を挙げて再試行する」ではなく
+ * 「恒久エラーを挙げて即座に諦める」向きにしているのは、見落としたときの転び方が逆だから。
+ * 一時障害の文言（`INTERNAL` など）を挙げ漏らすと再試行が効かず、
+ * この仕組みが防ごうとしている取りこぼしがそのまま残る。
+ * 逆に恒久エラーを挙げ漏らしても、数秒よけいに待って同じように失敗するだけで済む。
+ * GASの例外メッセージは実行者のロケールで変わりうるので、この差は小さくない。
+ *
+ * 使い切ったら例外にして、GASの失敗通知メールに載せる。
+ */
+function withStorageRetry_(description, operation) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return operation();
+    } catch (e) {
+      // 待っても直らないものは即座に諦める。設定不備を再試行のログで埋もれさせない
+      if (PERMANENT_STORAGE_ERROR.test(String(e && e.message || e))) throw e;
+      if (attempt >= STORAGE_ATTEMPTS) {
+        throw new Error(description + 'に' + STORAGE_ATTEMPTS + '回失敗しました: ' + e);
+      }
+      console.warn(description + 'に失敗(' + attempt + '/' + STORAGE_ATTEMPTS + ')。再試行します: ' + e);
+      Utilities.sleep(STORAGE_RETRY_BASE_MS * Math.pow(2, attempt - 1));
+    }
+  }
+}
+
+function getConfig_(store) {
+  const rawCalendarIds = store.get(PROP_CALENDAR_ID);
+  const webhookUrl = store.get(PROP_SLACK_WEBHOOK_URL);
   const missing = [];
   if (!rawCalendarIds) missing.push(PROP_CALENDAR_ID);
   if (!webhookUrl) missing.push(PROP_SLACK_WEBHOOK_URL);
@@ -72,12 +150,12 @@ function primedAtKey_(calendarId) {
  * 初回のみ手動実行: 各カレンダーの現時点を基点に記録（通知は出さない）
  */
 function initialize() {
-  const config = getConfig_();
-  const props = PropertiesService.getScriptProperties();
+  const store = openStore_();
+  const config = getConfig_(store);
   for (const calendarId of config.calendarIds) {
-    createBaseline_(props, calendarId);
+    createBaseline_(store, calendarId);
   }
-  props.deleteProperty(PROP_LEGACY_SYNC_TOKEN);
+  store.remove(PROP_LEGACY_SYNC_TOKEN);
   console.log('初期化完了: ' + config.calendarIds.length + '件のカレンダー');
 }
 
@@ -106,11 +184,11 @@ function primeFingerprints() {
     throw new Error('定期実行が動いているため中止しました。しばらく待ってから実行し直してください');
   }
   try {
-    const config = getConfig_();
-    const props = PropertiesService.getScriptProperties();
+    const store = openStore_();
+    const config = getConfig_(store);
     for (const calendarId of config.calendarIds) {
       const snapshot = fullSync_(calendarId).items;
-      const result = primeCalendar_(props, calendarId, snapshot, pendingChangedIds_(props, calendarId));
+      const result = primeCalendar_(store, calendarId, snapshot, pendingChangedIds_(store, calendarId));
       console.log(calendarId + ': ' + result.recorded + '件の予定から指紋を記録しました'
         + (result.held > 0
           ? '（未通知の差分にある ' + result.held + '件は次の定期実行に譲るため記録せず）'
@@ -126,10 +204,10 @@ function primeFingerprints() {
  * イベント）は記録しない。記録すると、その差分を受け取った定期実行が
  * 「前回見たときと同じ」と判定して通知を消してしまう。
  */
-function primeCalendar_(props, calendarId, snapshot, excludedIds) {
+function primeCalendar_(store, calendarId, snapshot, excludedIds) {
   const recordable = snapshot.filter(function (ev) { return !excludedIds[ev.id]; });
-  writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), recordable);
-  props.setProperty(primedAtKey_(calendarId), new Date().toISOString());
+  writeSeenEvents_(store, calendarId, readSeenEvents_(store, calendarId), recordable);
+  store.set(primedAtKey_(calendarId), new Date().toISOString());
   return { recorded: recordable.length, held: snapshot.length - recordable.length };
 }
 
@@ -150,9 +228,9 @@ function idsOf_(events) {
  * 分からないまま記録すると、通知が消える側に倒れるため（失効した `syncToken` も同様。
  * その場合は次の定期実行が基準点を作り直し、そこで指紋も記録される）。
  */
-function pendingChangedIds_(props, calendarId) {
+function pendingChangedIds_(store, calendarId) {
   const ids = Object.create(null);
-  const syncToken = props.getProperty(syncTokenKey_(calendarId));
+  const syncToken = store.get(syncTokenKey_(calendarId));
   if (!syncToken) return ids;  // 基準点がまだ無い。次の定期実行が作る
   let pageToken;
   do {
@@ -174,10 +252,10 @@ function pendingChangedIds_(props, calendarId) {
  * 現時点を差分の基点にする。フル同期で得た予定の指紋も一緒に記録して、
  * 基点を作り直した直後に巻き添えの通知が噴き出すのを防ぐ。
  */
-function createBaseline_(props, calendarId) {
+function createBaseline_(store, calendarId) {
   const result = fullSync_(calendarId);
-  props.setProperty(syncTokenKey_(calendarId), result.syncToken);
-  primeCalendar_(props, calendarId, result.items, Object.create(null));
+  store.set(syncTokenKey_(calendarId), result.syncToken);
+  primeCalendar_(store, calendarId, result.items, Object.create(null));
 }
 
 /**
@@ -191,16 +269,16 @@ function notifyCalendarChanges() {
     return;
   }
   try {
-    const config = getConfig_();
-    const props = PropertiesService.getScriptProperties();
-    migrateLegacySyncToken_(props, config.calendarIds);
+    const store = openStore_();
+    const config = getConfig_(store);
+    migrateLegacySyncToken_(store, config.calendarIds);
 
     let failures = 0;
     for (const calendarId of config.calendarIds) {
-      failures += notifyOneCalendar_(props, config, calendarId);
+      failures += notifyOneCalendar_(store, config, calendarId);
     }
     if (failures > 0) {
-      // syncToken は投稿前に進んでいるため、失敗した通知は取りこぼしになる。
+      // 投稿できなかった分は取りこぼしになる（差分は記録済みで、次の実行には出てこない）。
       // 例外にしてGASの失敗通知メールで気づけるようにする
       throw new Error('Slackへの投稿に ' + failures + '件失敗しました');
     }
@@ -213,31 +291,37 @@ function notifyCalendarChanges() {
  * `SYNC_TOKEN`（単一カレンダー時代のキー）を `SYNC_TOKEN:<カレンダーID>` へ移す。
  * 監視対象が1件のときだけ引き継げる。複数なら基準点を取り直すしかないので捨てる。
  */
-function migrateLegacySyncToken_(props, calendarIds) {
-  const legacy = props.getProperty(PROP_LEGACY_SYNC_TOKEN);
+function migrateLegacySyncToken_(store, calendarIds) {
+  const legacy = store.get(PROP_LEGACY_SYNC_TOKEN);
   if (!legacy) return;
-  if (calendarIds.length === 1 && !props.getProperty(syncTokenKey_(calendarIds[0]))) {
-    props.setProperty(syncTokenKey_(calendarIds[0]), legacy);
+  if (calendarIds.length === 1 && !store.get(syncTokenKey_(calendarIds[0]))) {
+    store.set(syncTokenKey_(calendarIds[0]), legacy);
     console.log('SYNC_TOKEN を ' + syncTokenKey_(calendarIds[0]) + ' へ移行しました');
   }
-  props.deleteProperty(PROP_LEGACY_SYNC_TOKEN);
+  store.remove(PROP_LEGACY_SYNC_TOKEN);
 }
 
 /**
  * 1カレンダー分の差分を通知する。戻り値はSlack投稿の失敗件数。
+ *
+ * 記録（`syncToken` と指紋）は**Slackへ投稿し終えてから**行う。逆順にすると、
+ * 記録と投稿のあいだでスクリプト プロパティが落ちたときに
+ * 「差分は消費済み・通知は未送信」となって取りこぼす。
+ * 投稿を先にしておけば、同じ失敗が起きても `syncToken` は進んでいないので、
+ * 次の実行が同じ差分をもう一度受け取って通知できる（最悪でも重複＝安全側）。
  */
-function notifyOneCalendar_(props, config, calendarId) {
+function notifyOneCalendar_(store, config, calendarId) {
   const tokenKey = syncTokenKey_(calendarId);
-  let syncToken = props.getProperty(tokenKey);
+  let syncToken = store.get(tokenKey);
   if (!syncToken) {
-    createBaseline_(props, calendarId);
+    createBaseline_(store, calendarId);
     console.log(calendarId + ': 基準点を作成しました（通知なし）');
     return 0;
   }
 
   // 下敷きがまだ無いカレンダーは、この実行で作る。フル同期は差分の取得より**先**に行う。
   // 後にすると、その間に入った変更が「変更後」の姿で記録され、次の実行で通知が消える
-  const snapshot = props.getProperty(primedAtKey_(calendarId)) === null
+  const snapshot = store.get(primedAtKey_(calendarId)) === null
     ? fullSync_(calendarId).items
     : null;
 
@@ -262,21 +346,11 @@ function notifyOneCalendar_(props, config, calendarId) {
     // それ以外（一時的なエラー・クォータ超過など）は再スローし、GASの失敗通知メールに載せる
     if (!isSyncTokenExpired_(e)) throw e;
     console.warn(calendarId + ': syncToken失効のため基準点を取り直します: ' + e);
-    createBaseline_(props, calendarId);
+    createBaseline_(store, calendarId);
     return 0;
   }
-  props.setProperty(tokenKey, syncToken);
 
-  const seen = readSeenEvents_(props, calendarId);
-  const fingerprints = toFingerprintMaps_(seen);
-  if (snapshot) {
-    // 今回通知する差分は記録しない。記録すると、この実行の通知判定より先に
-    // 「変わっていない」ことにしてしまう
-    const primed = primeCalendar_(props, calendarId, snapshot, idsOf_(changed));
-    console.log(calendarId + ': 指紋の下敷きを作成しました（' + primed.recorded + '件）');
-  }
-  // 下敷きを書いたあとの内容に、今回見た分を積み直す
-  writeSeenEvents_(props, calendarId, readSeenEvents_(props, calendarId), changed);
+  const fingerprints = toFingerprintMaps_(readSeenEvents_(store, calendarId));
 
   const changedThisTime = changed.filter(function (ev) { return !isUnchangedResend_(ev, fingerprints.content); });
   const resent = changed.length - changedThisTime.length;
@@ -305,19 +379,42 @@ function notifyOneCalendar_(props, config, calendarId) {
     ? '\nカレンダー: ' + (calendarName || calendarId)
     : '';
 
+  let failures = 0;
   if (notifiable.length > MAX_NOTIFICATIONS_PER_RUN) {
     console.warn(calendarId + ': 変更 ' + notifiable.length + '件。上限を超えたため個別通知を抑止');
-    const posted = postToSlack_(config.webhookUrl,
+    if (!postToSlack_(config.webhookUrl,
       '⚠️ カレンダーの変更を ' + notifiable.length + '件 検知しました（個別通知の上限 '
-      + MAX_NOTIFICATIONS_PER_RUN + '件 を超えたため一覧は省略します）。カレンダーを直接ご確認ください。' + suffix);
-    return posted ? 0 : 1;
+      + MAX_NOTIFICATIONS_PER_RUN + '件 を超えたため一覧は省略します）。カレンダーを直接ご確認ください。' + suffix)) {
+      failures++;
+    }
+  } else {
+    for (const ev of notifiable) {
+      if (!postToSlack_(config.webhookUrl, formatMessage_(calendarId, ev) + suffix)) failures++;
+    }
   }
 
-  let failures = 0;
-  for (const ev of notifiable) {
-    if (!postToSlack_(config.webhookUrl, formatMessage_(calendarId, ev) + suffix)) failures++;
-  }
+  commitSeen_(store, calendarId, tokenKey, syncToken, snapshot, changed);
   return failures;
+}
+
+/**
+ * 今回の差分を「見た」ことにして記録する。Slackへ投稿し終えてから呼ぶ。
+ *
+ * `syncToken` を先に書くのは、途中で失敗したときに安全側へ倒すため。
+ * 指紋だけ書けて `syncToken` を書けないと、次の実行が同じ差分を受け取ったときに
+ * 「前回見たときと同じ」と判定して、通知すべき変更を消してしまう。
+ * 逆（`syncToken` だけ書けた）なら、指紋が古いまま残るだけで、
+ * 次にその予定が差分へ乗ったときに1回多く通知されるだけで済む。
+ */
+function commitSeen_(store, calendarId, tokenKey, syncToken, snapshot, changed) {
+  store.set(tokenKey, syncToken);
+  if (snapshot) {
+    // 今回の差分に居るイベントは下敷きに含めない。このあと差分側の指紋で積み直すため
+    const primed = primeCalendar_(store, calendarId, snapshot, idsOf_(changed));
+    console.log(calendarId + ': 指紋の下敷きを作成しました（' + primed.recorded + '件）');
+  }
+  // 下敷きを書いたあとの内容に、今回見た分を積み直す
+  writeSeenEvents_(store, calendarId, readSeenEvents_(store, calendarId), changed);
 }
 
 /**
@@ -430,8 +527,8 @@ function canonicalize_(value, ignoredFields) {
  * 保存済みの指紋。`[[イベントID, 中身の指紋, 管理情報を除いた指紋?], ...]` の新しい順。
  * 3つめはシリーズ本体にだけ付く。読めなければ空（＝何も落とさない）
  */
-function readSeenEvents_(props, calendarId) {
-  const raw = props.getProperty(seenEventsKey_(calendarId));
+function readSeenEvents_(store, calendarId) {
+  const raw = store.get(seenEventsKey_(calendarId));
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw);
@@ -459,7 +556,7 @@ function toFingerprintMaps_(entries) {
  * 今回見たイベントの指紋を先頭に積み直して保存する。上限を超えた分は古い順に捨てる。
  * 通知したかどうかに関わらず、差分で見たものはすべて記録する（落とした回の再送も黙らせるため）。
  */
-function writeSeenEvents_(props, calendarId, previous, events) {
+function writeSeenEvents_(store, calendarId, previous, events) {
   const recorded = Object.create(null);
   const entries = [];
   const push = function (entry) {
@@ -483,7 +580,7 @@ function writeSeenEvents_(props, calendarId, previous, events) {
     entries.pop();
     json = JSON.stringify(entries);
   }
-  props.setProperty(seenEventsKey_(calendarId), json);
+  store.set(seenEventsKey_(calendarId), json);
 }
 
 /**

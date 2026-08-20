@@ -21,13 +21,26 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
     ...properties,
   }));
 
-  const scriptProperties = {
-    getProperty: (key) => (store.has(key) ? store.get(key) : null),
-    setProperty: (key, value) => { store.set(key, String(value)); },
-    deleteProperty: (key) => { store.delete(key); },
-  };
+  /**
+   * スクリプト プロパティ。`storageFault` で Google 側の一時障害を再現できる。
+   * 呼ばれた操作は `storageOps` に積むので、読み取り回数や
+   * 「投稿の前に書いたか、あとに書いたか」を検証できる。
+   */
+  function buildScriptProperties({ storageFault, storageOps, posts }) {
+    const guard = (op, key) => {
+      // postedBefore: この操作の時点で何件Slackへ投稿し終えていたか
+      storageOps.push({ op, key, postedBefore: posts.length });
+      if (storageFault) storageFault({ op, key, call: storageOps.length });
+    };
+    return {
+      getProperties: () => { guard('getProperties'); return Object.fromEntries(store); },
+      getProperty: (key) => { guard('getProperty', key); return store.has(key) ? store.get(key) : null; },
+      setProperty: (key, value) => { guard('setProperty', key); store.set(key, String(value)); },
+      deleteProperty: (key) => { guard('deleteProperty', key); store.delete(key); },
+    };
+  }
 
-  function buildSandbox({ items, listImpl, slackStatus, lockHeld, logs, posts }) {
+  function buildSandbox({ items, listImpl, slackStatus, lockHeld, logs, posts, requests, scriptProperties }) {
     let listCalls = 0;
     return {
       console: {
@@ -64,17 +77,24 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
       },
       UrlFetchApp: {
         fetch: (url, options) => {
-          posts.push(JSON.parse(options.payload).text);
+          const text = JSON.parse(options.payload).text;
+          requests.push(text);
+          // posts は投稿し終えた分だけ。429/5xx の再試行を「投稿済み」と数えると、
+          // storageOps の postedBefore（＝何件投稿し終えていたか）がずれる
+          if (slackStatus === 200) posts.push(text);
           return { getResponseCode: () => slackStatus, getContentText: () => 'ok' };
         },
       },
     };
   }
 
-  function evaluate({ items = [], listImpl, slackStatus = 200, lockHeld = false, call }) {
+  function evaluate({ items = [], listImpl, slackStatus = 200, lockHeld = false, storageFault, call }) {
     const logs = [];
     const posts = [];
-    const sandbox = buildSandbox({ items, listImpl, slackStatus, lockHeld, logs, posts });
+    const requests = [];
+    const storageOps = [];
+    const scriptProperties = buildScriptProperties({ storageFault, storageOps, posts });
+    const sandbox = buildSandbox({ items, listImpl, slackStatus, lockHeld, logs, posts, requests, scriptProperties });
     vm.createContext(sandbox);
     vm.runInContext(SOURCE, sandbox);
     let error = null;
@@ -83,7 +103,8 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
     } catch (e) {
       error = e;
     }
-    return { posts, logs, error, sandbox, properties: Object.fromEntries(store) };
+    // posts: 投稿し終えた分 / requests: 再試行を含む投稿の試行
+    return { posts, requests, logs, error, sandbox, storageOps, properties: Object.fromEntries(store) };
   }
 
   return {

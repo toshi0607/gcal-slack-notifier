@@ -583,3 +583,195 @@ test('基準点の作成でも下敷きのマーカーが立つ', () => {
 
   assert.ok(calendar.property('FINGERPRINTS_PRIMED_AT:' + CALENDAR_ID));
 });
+
+/**
+ * スクリプト プロパティの一時障害（`Error code INTERNAL.`）への備え。
+ * 2026-08-19 に定期実行が5回連続でこれに落ちた。Google側の障害なので避けられないが、
+ * 再試行・呼び出し回数の削減・記録の順序で、取りこぼさず・気づかず終わらないようにする。
+ */
+const internalError = () => new Error(
+  "We're sorry, a server error occurred while reading from storage. Error code INTERNAL.");
+
+test('スクリプト プロパティの読み取りは1実行につき1回にまとめる', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({ items: [seriesA] });
+
+  const reads = result.storageOps.filter((o) => o.op === 'getProperties' || o.op === 'getProperty');
+  assert.deepEqual(reads.map((o) => o.op), ['getProperties'],
+    '読み取りのたびに一時障害を踏む機会が増える。まとめて1回だけ読む');
+});
+
+test('読み取りの一時障害は再試行して回復する', () => {
+  const calendar = createSyncedCalendar();
+  let failures = 0;
+  const result = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op }) => {
+      if (op === 'getProperties' && failures++ < 2) throw internalError();
+    },
+  });
+
+  assert.equal(result.error, null, '再試行で回復するはず');
+  assert.equal(result.posts.length, 1);
+  assert.ok(result.logs.some((l) => /再試行します/.test(l)), '再試行したことをログに残す');
+});
+
+test('書き込みの一時障害も再試行して回復する', () => {
+  const calendar = createSyncedCalendar();
+  let failures = 0;
+  const result = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op }) => {
+      if (op === 'setProperty' && failures++ < 2) throw internalError();
+    },
+  });
+
+  assert.equal(result.error, null);
+  assert.notEqual(calendar.property('SYNC_TOKEN:' + CALENDAR_ID), 'tok-0', 'syncToken を書けている');
+});
+
+test('再試行しても駄目なら握りつぶさず例外にする', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op }) => { if (op === 'getProperties') throw internalError(); },
+  });
+
+  assert.ok(result.error, '失敗通知メールで気づけるよう例外にする');
+  assert.match(String(result.error.message), /4回失敗/);
+});
+
+test('読み取りに失敗した実行は syncToken を進めない（次の実行が同じ差分を拾う）', () => {
+  const calendar = createSyncedCalendar();
+  const failed = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op }) => { if (op === 'getProperties') throw internalError(); },
+  });
+
+  assert.ok(failed.error);
+  assert.equal(failed.posts.length, 0);
+  assert.equal(calendar.property('SYNC_TOKEN:' + CALENDAR_ID), 'tok-0', '差分を消費してはいけない');
+
+  const recovered = calendar.run({ items: [seriesA] });
+  assert.equal(recovered.posts.length, 1, '次の実行が取りこぼした差分を通知する');
+});
+
+test('記録はSlackへ投稿し終えてから行う', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({ items: [seriesA, seriesB] });
+
+  assert.equal(result.posts.length, 2);
+  const writes = result.storageOps.filter((o) => o.op === 'setProperty');
+  assert.ok(writes.length > 0);
+  for (const write of writes) {
+    assert.equal(write.postedBefore, 2,
+      '投稿より先に記録すると、そのあいだの storage 障害で通知が消える');
+  }
+});
+
+test('記録に失敗しても通知は出ており、syncToken を進めなければ次の実行が拾い直す', () => {
+  const calendar = createSyncedCalendar();
+  const failed = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op, key }) => {
+      if (op === 'setProperty' && key.startsWith('SYNC_TOKEN:')) throw internalError();
+    },
+  });
+
+  assert.equal(failed.posts.length, 1, '記録より先に投稿しているので通知は出る');
+  assert.ok(failed.error);
+  assert.equal(calendar.property('SYNC_TOKEN:' + CALENDAR_ID), 'tok-0');
+  assert.equal(calendar.property(SEEN_KEY), null, 'syncToken を書けなければ指紋も残さない');
+
+  // 取りこぼすより重複するほうが安全。次の実行が同じ差分をもう一度通知する
+  const retried = calendar.run({ items: [seriesA] });
+  assert.equal(retried.posts.length, 1);
+});
+
+test('syncToken を書いたあとに失敗しても、指紋が古いだけで通知は消えない', () => {
+  const calendar = createSyncedCalendar();
+  const failed = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op, key }) => {
+      if (op === 'setProperty' && key.startsWith('SEEN_EVENTS:')) throw internalError();
+    },
+  });
+
+  assert.equal(failed.posts.length, 1);
+  assert.ok(failed.error);
+  assert.notEqual(calendar.property('SYNC_TOKEN:' + CALENDAR_ID), 'tok-0', 'syncToken は先に書けている');
+  assert.equal(calendar.property(SEEN_KEY), null);
+
+  // 指紋が無いので次に同じ予定が差分へ乗れば通知される（＝多いだけで、消えない）
+  const next = calendar.run({ items: [seriesA] });
+  assert.equal(next.posts.length, 1);
+});
+
+test('待っても直らないエラーは再試行せずに諦める', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op }) => {
+      if (op === 'getProperties') throw new Error('You do not have permission to perform that action.');
+    },
+  });
+
+  assert.ok(result.error);
+  assert.match(String(result.error.message), /permission/, '原因の文言をそのまま失敗通知メールへ渡す');
+  assert.ok(!result.logs.some((l) => /再試行します/.test(l)), '設定不備を再試行のログで埋もれさせない');
+});
+
+test('文言に心当たりが無いエラーは一時障害として再試行する', () => {
+  const calendar = createSyncedCalendar();
+  let failures = 0;
+  const result = calendar.run({
+    items: [seriesA],
+    // 一時障害の文言を挙げ漏らすと再試行が効かなくなるので、既定は再試行する側
+    storageFault: ({ op }) => {
+      if (op === 'getProperties' && failures++ < 2) throw new Error('Service unavailable. Please try again.');
+    },
+  });
+
+  assert.equal(result.error, null);
+  assert.equal(result.posts.length, 1);
+});
+
+test('Slack投稿の再試行は「投稿し終えた」数に数えない', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({ items: [single], slackStatus: 500 });
+
+  assert.equal(result.requests.length, 3, '429/5xx は3回まで再試行する');
+  assert.equal(result.posts.length, 0, '成功していない投稿を数えてはいけない');
+  assert.ok(result.error);
+});
+
+test('短時間のレート制限は再試行して回復する（日次上限と混同しない）', () => {
+  const calendar = createSyncedCalendar();
+  let failures = 0;
+  const result = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op }) => {
+      if (op === 'getProperties' && failures++ < 2) {
+        throw new Error('Service invoked too many times in a short time: properties.'
+          + ' Try Utilities.sleep(1000) between calls.');
+      }
+    },
+  });
+
+  assert.equal(result.error, null, '待てば直るレート制限を恒久エラー扱いしてはいけない');
+  assert.equal(result.posts.length, 1);
+});
+
+test('1日あたりの呼び出し上限は再試行せずに諦める', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op }) => {
+      if (op === 'getProperties') throw new Error('Service invoked too many times for one day: properties.');
+    },
+  });
+
+  assert.ok(result.error);
+  assert.match(String(result.error.message), /for one day/);
+  assert.ok(!result.logs.some((l) => /再試行します/.test(l)), '日をまたぐまで直らないので待たない');
+});
