@@ -40,7 +40,7 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
     };
   }
 
-  function buildSandbox({ items, listImpl, slackStatus, lockHeld, logs, posts, scriptProperties }) {
+  function buildSandbox({ items, listImpl, slackStatus, lockHeld, logs, posts, requests, scriptProperties }) {
     let listCalls = 0;
     return {
       console: {
@@ -77,7 +77,11 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
       },
       UrlFetchApp: {
         fetch: (url, options) => {
-          posts.push(JSON.parse(options.payload).text);
+          const text = JSON.parse(options.payload).text;
+          requests.push(text);
+          // posts は投稿し終えた分だけ。429/5xx の再試行を「投稿済み」と数えると、
+          // storageOps の postedBefore（＝何件投稿し終えていたか）がずれる
+          if (slackStatus === 200) posts.push(text);
           return { getResponseCode: () => slackStatus, getContentText: () => 'ok' };
         },
       },
@@ -87,9 +91,10 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
   function evaluate({ items = [], listImpl, slackStatus = 200, lockHeld = false, storageFault, call }) {
     const logs = [];
     const posts = [];
+    const requests = [];
     const storageOps = [];
     const scriptProperties = buildScriptProperties({ storageFault, storageOps, posts });
-    const sandbox = buildSandbox({ items, listImpl, slackStatus, lockHeld, logs, posts, scriptProperties });
+    const sandbox = buildSandbox({ items, listImpl, slackStatus, lockHeld, logs, posts, requests, scriptProperties });
     vm.createContext(sandbox);
     vm.runInContext(SOURCE, sandbox);
     let error = null;
@@ -98,7 +103,8 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
     } catch (e) {
       error = e;
     }
-    return { posts, logs, error, sandbox, storageOps, properties: Object.fromEntries(store) };
+    // posts: 投稿し終えた分 / requests: 再試行を含む投稿の試行
+    return { posts, requests, logs, error, sandbox, storageOps, properties: Object.fromEntries(store) };
   }
 
   return {

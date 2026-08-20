@@ -706,3 +706,41 @@ test('syncToken を書いたあとに失敗しても、指紋が古いだけで�
   const next = calendar.run({ items: [seriesA] });
   assert.equal(next.posts.length, 1);
 });
+
+test('待っても直らないエラーは再試行せずに諦める', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op }) => {
+      if (op === 'getProperties') throw new Error('You do not have permission to perform that action.');
+    },
+  });
+
+  assert.ok(result.error);
+  assert.match(String(result.error.message), /permission/, '原因の文言をそのまま失敗通知メールへ渡す');
+  assert.ok(!result.logs.some((l) => /再試行します/.test(l)), '設定不備を再試行のログで埋もれさせない');
+});
+
+test('文言に心当たりが無いエラーは一時障害として再試行する', () => {
+  const calendar = createSyncedCalendar();
+  let failures = 0;
+  const result = calendar.run({
+    items: [seriesA],
+    // 一時障害の文言を挙げ漏らすと再試行が効かなくなるので、既定は再試行する側
+    storageFault: ({ op }) => {
+      if (op === 'getProperties' && failures++ < 2) throw new Error('Service unavailable. Please try again.');
+    },
+  });
+
+  assert.equal(result.error, null);
+  assert.equal(result.posts.length, 1);
+});
+
+test('Slack投稿の再試行は「投稿し終えた」数に数えない', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({ items: [single], slackStatus: 500 });
+
+  assert.equal(result.requests.length, 3, '429/5xx は3回まで再試行する');
+  assert.equal(result.posts.length, 0, '成功していない投稿を数えてはいけない');
+  assert.ok(result.error);
+});

@@ -45,6 +45,10 @@ const BOOKKEEPING_FIELDS = ['updated', 'sequence'];
 const STORAGE_ATTEMPTS = 4;
 const STORAGE_RETRY_BASE_MS = 500;
 
+// 再試行しても直らないと分かっているエラー。載っていないものは一時障害とみなして再試行する。
+// 権限不足・認可切れ・値のサイズ超過・1日あたりの呼び出し上限が該当する。
+const PERMANENT_STORAGE_ERROR = /permission|authoriz|too large|too many times|quota/i;
+
 /**
  * スクリプト プロパティの読み書き口。
  *
@@ -83,8 +87,15 @@ function openStore_() {
 
 /**
  * スクリプト プロパティの操作を、指数バックオフ付きで再試行する。
+ * 読み取り・書き込み・削除はいずれも冪等なので、再試行そのものは安全に行える。
  *
- * 読み取り・書き込み・削除はいずれも冪等なので、原因を問わず再試行してよい。
+ * 判定を「一時障害を挙げて再試行する」ではなく
+ * 「恒久エラーを挙げて即座に諦める」向きにしているのは、見落としたときの転び方が逆だから。
+ * 一時障害の文言（`INTERNAL` など）を挙げ漏らすと再試行が効かず、
+ * この仕組みが防ごうとしている取りこぼしがそのまま残る。
+ * 逆に恒久エラーを挙げ漏らしても、数秒よけいに待って同じように失敗するだけで済む。
+ * GASの例外メッセージは実行者のロケールで変わりうるので、この差は小さくない。
+ *
  * 使い切ったら例外にして、GASの失敗通知メールに載せる。
  */
 function withStorageRetry_(description, operation) {
@@ -92,6 +103,8 @@ function withStorageRetry_(description, operation) {
     try {
       return operation();
     } catch (e) {
+      // 待っても直らないものは即座に諦める。設定不備を再試行のログで埋もれさせない
+      if (PERMANENT_STORAGE_ERROR.test(String(e && e.message || e))) throw e;
       if (attempt >= STORAGE_ATTEMPTS) {
         throw new Error(description + 'に' + STORAGE_ATTEMPTS + '回失敗しました: ' + e);
       }
