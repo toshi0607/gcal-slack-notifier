@@ -47,7 +47,11 @@ const STORAGE_RETRY_BASE_MS = 500;
 
 // 再試行しても直らないと分かっているエラー。載っていないものは一時障害とみなして再試行する。
 // 権限不足・認可切れ・値のサイズ超過・1日あたりの呼び出し上限が該当する。
-const PERMANENT_STORAGE_ERROR = /permission|authoriz|too large|too many times|quota/i;
+//
+// 呼び出し上限は "for one day"（日次）に限る。GASには
+// "Service invoked too many times in a short time: ... Try Utilities.sleep(1000) between calls."
+// という短時間のレート制限もあり、こちらは待てば直る＝再試行する側
+const PERMANENT_STORAGE_ERROR = /permission|authoriz|too large|too many times for one day|quota/i;
 
 /**
  * スクリプト プロパティの読み書き口。

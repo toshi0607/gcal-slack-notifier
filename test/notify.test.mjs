@@ -744,3 +744,34 @@ test('Slack投稿の再試行は「投稿し終えた」数に数えない', () 
   assert.equal(result.posts.length, 0, '成功していない投稿を数えてはいけない');
   assert.ok(result.error);
 });
+
+test('短時間のレート制限は再試行して回復する（日次上限と混同しない）', () => {
+  const calendar = createSyncedCalendar();
+  let failures = 0;
+  const result = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op }) => {
+      if (op === 'getProperties' && failures++ < 2) {
+        throw new Error('Service invoked too many times in a short time: properties.'
+          + ' Try Utilities.sleep(1000) between calls.');
+      }
+    },
+  });
+
+  assert.equal(result.error, null, '待てば直るレート制限を恒久エラー扱いしてはいけない');
+  assert.equal(result.posts.length, 1);
+});
+
+test('1日あたりの呼び出し上限は再試行せずに諦める', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({
+    items: [seriesA],
+    storageFault: ({ op }) => {
+      if (op === 'getProperties') throw new Error('Service invoked too many times for one day: properties.');
+    },
+  });
+
+  assert.ok(result.error);
+  assert.match(String(result.error.message), /for one day/);
+  assert.ok(!result.logs.some((l) => /再試行します/.test(l)), '日をまたぐまで直らないので待たない');
+});
