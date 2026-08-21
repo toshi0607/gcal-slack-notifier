@@ -775,3 +775,91 @@ test('1日あたりの呼び出し上限は再試行せずに諦める', () => {
   assert.match(String(result.error.message), /for one day/);
   assert.ok(!result.logs.some((l) => /再試行します/.test(l)), '日をまたぐまで直らないので待たない');
 });
+
+// --- 前に消した回の再送 / シリーズ本体への EXDATE 追加（2026-08-21 の実測）---
+
+const LAST_RUN_KEY = 'LAST_RUN_AT:' + CALENDAR_ID;
+
+test('前回の実行より前に消された回は、再送されても通知しない', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [] });  // ここで LAST_RUN_AT が入る
+  assert.ok(calendar.property(LAST_RUN_KEY));
+
+  // 9/17 は前に消した分（updated が古い）、10/1 が今回消した分
+  const old = cancelledOccurrence('A_20260917', 'A', '2026-09-17T19:30:00+09:00', '2026-08-01T00:00:00Z');
+  const fresh = cancelledOccurrence('A_20261001', 'A', '2026-10-01T19:30:00+09:00', '2026-08-14T02:50:00Z');
+
+  const second = calendar.run({ items: [old, fresh] });
+
+  assert.deepEqual(headlines(second.posts), ['🗑️ 予定が削除されました']);
+  assert.match(second.posts[0], /2026-10-01/);
+  assert.ok(second.logs.some((l) => l.includes('前回の実行より前に消された 1件')));
+});
+
+test('前回の実行の直前に消された分は通知する（時計のずれの余裕）', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [] });  // LAST_RUN_AT = 2026-08-14T02:46:00Z
+
+  // 30秒前の削除。反映が遅れて次の実行で乗ってきたケース
+  const justBefore = cancelledOccurrence('A_20260917', 'A', '2026-09-17T19:30:00+09:00', '2026-08-14T02:45:30Z');
+  const second = calendar.run({ items: [justBefore] });
+
+  assert.equal(second.posts.length, 1, '反映遅れの削除を握りつぶしてはいけない');
+});
+
+test('削除以外は updated が古くても通知する', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  // リマインダーだけの変更。updated は進まない（＝前回の実行より前のまま）
+  const remindersChanged = {
+    ...seriesA,
+    reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 15 }] },
+  };
+  const second = calendar.run({ items: [remindersChanged] });
+
+  assert.equal(second.posts.length, 1, '削除以外に updated の古さを使ってはいけない');
+});
+
+test('本体に EXDATE が積まれただけなら、回を通知するときは本体を黙らせる', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  // 8/19 の回を削除。本体には EXDATE が積まれ、updated と sequence も動く
+  const withExdate = {
+    ...seriesA,
+    recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=WE', 'EXDATE;TZID=Asia/Tokyo:20260819T193000'],
+    updated: '2026-08-15T00:06:00Z',
+    sequence: 3,
+  };
+  const second = calendar.run({
+    items: [withExdate, cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z')],
+  });
+
+  assert.deepEqual(headlines(second.posts), ['🗑️ 予定が削除されました']);
+  assert.match(second.posts[0], /2026-08-19/);
+});
+
+test('繰り返しルール自体が変われば、EXDATE が付いていても本体を通知する', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  const ruleChanged = {
+    ...seriesA,
+    recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=TH', 'EXDATE;TZID=Asia/Tokyo:20260819T193000'],
+    updated: '2026-08-15T00:06:00Z',
+    sequence: 3,
+  };
+  const second = calendar.run({
+    items: [ruleChanged, cancelledOccurrence('A_20260819', 'A', '2026-08-19T19:30:00+09:00', '2026-08-15T00:06:00Z')],
+  });
+
+  assert.equal(second.posts.length, 2, 'シリーズ自体の変更を握りつぶしてはいけない');
+});
+
+test('通知したイベントは診断用にログへ残す', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({ items: [seriesA] });
+
+  assert.ok(result.logs.some((l) => l.includes('通知 id=A') && l.includes('指紋=無し') && l.includes('種別=シリーズ本体')));
+});
