@@ -78,7 +78,7 @@ GASエディタの「プロジェクトの設定」→「スクリプト プロ�
 | `CALENDAR_ID` | 手順2のカレンダーID。複数監視する場合はカンマ区切り（例: `a@group.calendar.google.com,b@group.calendar.google.com`） |
 | `SLACK_WEBHOOK_URL` | 手順1のWebhook URL |
 
-`SYNC_TOKEN:<カレンダーID>` と `SEEN_EVENTS:<カレンダーID>` はスクリプトが自動で保存するため手動設定は不要。
+`SYNC_TOKEN:<カレンダーID>`・`SEEN_EVENTS:<カレンダーID>`・`FINGERPRINTS_PRIMED_AT:<カレンダーID>`・`LAST_RUN_AT:<カレンダーID>` はスクリプトが自動で保存するため手動設定は不要。
 
 監視対象が2件以上のときは、通知の末尾にどのカレンダーの変更かが添えられる。
 

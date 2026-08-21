@@ -4,12 +4,14 @@
  *   SYNC_TOKEN:<カレンダーID>    差分同期用トークン（initialize() が自動で保存する。手動設定不要）
  *   SEEN_EVENTS:<カレンダーID>   直近に見たイベントの指紋（同上）
  *   FINGERPRINTS_PRIMED_AT:<カレンダーID>  指紋の下敷きを作った時刻（同上）
+ *   LAST_RUN_AT:<カレンダーID>  前回の差分取得を開始した時刻（同上）
  *****/
 const PROP_CALENDAR_ID = 'CALENDAR_ID';
 const PROP_SLACK_WEBHOOK_URL = 'SLACK_WEBHOOK_URL';
 const PROP_SYNC_TOKEN_PREFIX = 'SYNC_TOKEN:';
 const PROP_SEEN_EVENTS_PREFIX = 'SEEN_EVENTS:';
 const PROP_PRIMED_AT_PREFIX = 'FINGERPRINTS_PRIMED_AT:';
+const PROP_LAST_RUN_AT_PREFIX = 'LAST_RUN_AT:';
 
 // 単一カレンダーのみ対応していた頃のキー。移行のためだけに参照する
 const PROP_LEGACY_SYNC_TOKEN = 'SYNC_TOKEN';
@@ -32,6 +34,15 @@ const SEEN_EVENTS_MAX_BYTES = 8000;
 // 指紋に含めないフィールド。中身が同じでも変わりうるもの・通知に関係しないもの。
 // ここに挙げていないフィールドは未知のものも含めて指紋に入る（変化を見落とさない側に倒す）
 const FINGERPRINT_IGNORED_FIELDS = ['etag', 'kind', 'htmlLink'];
+
+// 削除がいつ行われたかを見るときの許容誤差（ミリ秒）。
+// `updated` はカレンダー側の時刻、比較相手はスクリプト側で測った実行開始時刻。
+// 差分APIへの反映遅れも含めて緩めに見る（迷ったら通知する側に倒す）
+const CANCELLED_SKEW_MS = 60 * 1000;
+
+// 回を1つ削除・移動すると、シリーズ本体の `recurrence` にこの行が積まれる。
+// 「その回をどうしたか」の記録なので、回そのものの通知と内容が重複する
+const OCCURRENCE_RULE_PATTERN = /^(EXDATE|RDATE)[;:]/i;
 
 // 回を操作したときにシリーズ本体側で動く管理情報。
 // 「本体そのものは変わっていない」を見分けるときだけ、上に加えて無視する。
@@ -144,6 +155,10 @@ function seenEventsKey_(calendarId) {
 
 function primedAtKey_(calendarId) {
   return PROP_PRIMED_AT_PREFIX + calendarId;
+}
+
+function lastRunAtKey_(calendarId) {
+  return PROP_LAST_RUN_AT_PREFIX + calendarId;
 }
 
 /**
@@ -319,6 +334,9 @@ function notifyOneCalendar_(store, config, calendarId) {
     return 0;
   }
 
+  const startedAt = new Date();
+  const lastRunAt = readLastRunAt_(store, calendarId);
+
   // 下敷きがまだ無いカレンダーは、この実行で作る。フル同期は差分の取得より**先**に行う。
   // 後にすると、その間に入った変更が「変更後」の姿で記録され、次の実行で通知が消える
   const snapshot = store.get(primedAtKey_(calendarId)) === null
@@ -358,10 +376,16 @@ function notifyOneCalendar_(store, config, calendarId) {
     console.log(calendarId + ': 巻き添えの再送 ' + resent + '件を通知対象から除外');
   }
 
-  const currentEvents = changedThisTime.filter(function (ev) { return !isPastOccurrence_(ev); });
-  const skipped = changedThisTime.length - currentEvents.length;
+  const notPast = changedThisTime.filter(function (ev) { return !isPastOccurrence_(ev); });
+  const skipped = changedThisTime.length - notPast.length;
   if (skipped > 0) {
     console.log(calendarId + ': 過去回の変更 ' + skipped + '件を通知対象から除外');
+  }
+
+  const currentEvents = notPast.filter(function (ev) { return !isStaleCancellation_(ev, lastRunAt); });
+  const stale = notPast.length - currentEvents.length;
+  if (stale > 0) {
+    console.log(calendarId + ': 前回の実行より前に消された ' + stale + '件を通知対象から除外');
   }
 
   // 「この回を通知する」ぶんのシリーズ本体は黙らせる。判定は通知する回だけを見る
@@ -389,11 +413,16 @@ function notifyOneCalendar_(store, config, calendarId) {
     }
   } else {
     for (const ev of notifiable) {
+      // 抑止が効かなかったときに、どの判定をすり抜けたか追えるようにする
+      console.log(calendarId + ': 通知 id=' + ev.id + ' status=' + (ev.status || '')
+        + ' 指紋=' + (fingerprints.content[ev.id] ? '不一致' : '無し')
+        + (ev.recurrence ? ' 種別=シリーズ本体' : (ev.recurringEventId ? ' 種別=回' : '')));
       if (!postToSlack_(config.webhookUrl, formatMessage_(calendarId, ev) + suffix)) failures++;
     }
   }
 
   commitSeen_(store, calendarId, tokenKey, syncToken, snapshot, changed);
+  store.set(lastRunAtKey_(calendarId), startedAt.toISOString());
   return failures;
 }
 
@@ -454,6 +483,38 @@ function parentIdsOf_(events) {
 }
 
 /**
+ * すでに済んでいる削除が、再び差分に乗ってきただけかどうか。
+ *
+ * 削除は `status: cancelled` になった時点で `updated` が動くので、削除イベントに限れば
+ * `updated` は「いつ消したか」を表す。前回の実行より前に消されていたなら、その削除は
+ * すでに知らせたか、このスクリプトを入れる前のもの。どちらにせよ今さら通知しても意味がない
+ * （2026-08-21 に実測: ごはんの回を1つ消したところ、以前に消した 9/17・10/1 の分まで
+ * 「削除されました」と通知された）。
+ *
+ * 判定を削除に限るのがポイント。`updated` は main event data の最終更新時刻で、
+ * リマインダーだけの変更では進まないため、更新イベントの判定には使えない。
+ * 削除は必ず `updated` が動くので、この用途でだけ意味を持つ。
+ */
+function isStaleCancellation_(ev, lastRunAt) {
+  if (ev.status !== 'cancelled' || !lastRunAt || !ev.updated) return false;
+  const updated = new Date(ev.updated).getTime();
+  if (isNaN(updated)) return false;
+  return updated < lastRunAt.getTime() - CANCELLED_SKEW_MS;
+}
+
+/** 前回の差分取得を開始した時刻。未記録・壊れている場合は null（＝この判定をしない） */
+function readLastRunAt_(store, calendarId) {
+  const raw = store.get(lastRunAtKey_(calendarId));
+  if (!raw) return null;
+  const at = new Date(raw);
+  if (isNaN(at.getTime())) {
+    console.warn(calendarId + ': ' + lastRunAtKey_(calendarId) + ' を日時として読めません: ' + raw);
+    return null;
+  }
+  return at;
+}
+
+/**
  * 今回は変更されていないのに差分へ巻き添えで乗ってきたイベントかどうか。
  *
  * 繰り返し予定を1回分だけ削除しても、差分にはその回だけが乗るとは限らない。シリーズ本体や、
@@ -491,12 +552,21 @@ function eventFingerprint_(ev) {
  * 管理情報を落とすのはイベント直下だけ。浅いコピーから消してから正規化する
  * （`canonicalize_()` は再帰的に落とすため、そのまま渡すと
  * `extendedProperties.private.updated` のような利用者の値まで消えてしまう）。
+ *
+ * `recurrence` の EXDATE / RDATE も落とす。回を1つ削除・移動すると本体側に積まれるが、
+ * 「その回をどうしたか」は回そのものの通知が伝えているので、本体から言い直す必要がない。
+ * RRULE（繰り返しのルール自体）は残すので、シリーズの変更は従来どおり通知される。
  */
 function semanticFingerprint_(ev) {
   const withoutBookkeeping = {};
   for (const key of Object.keys(ev)) {
     if (BOOKKEEPING_FIELDS.indexOf(key) >= 0) continue;
     withoutBookkeeping[key] = ev[key];
+  }
+  if (Array.isArray(ev.recurrence)) {
+    withoutBookkeeping.recurrence = ev.recurrence.filter(function (rule) {
+      return !OCCURRENCE_RULE_PATTERN.test(String(rule));
+    });
   }
   return digest_(JSON.stringify(canonicalize_(withoutBookkeeping, FINGERPRINT_IGNORED_FIELDS)));
 }
