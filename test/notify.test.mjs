@@ -59,6 +59,156 @@ test('巻き添えの再送は、前回と中身が同じなら通知しない',
   assert.match(second.posts[0], /2026-09-09T19:30:00\+09:00（繰り返しのうち1回）/);
 });
 
+test('削除済みの回は管理情報が動いて再送されても通知しない（2026-08-22 の実測の再現）', () => {
+  // 実測: 8/22 06:11 に回を1件消したら削除済みの回が巻き添え通知され、5分後の 06:16 に
+  // 別の回を消したら「同じ削除済みの回」がまた通知された。差分に乗る削除済みの
+  // ペイロードは親・兄弟を操作するたびに updated などの管理情報が動くため、
+  // 中身の指紋では二度と一致しない
+  const calendar = createSyncedCalendar();
+
+  // 1回目: 9/2 を消す。以前に消した 8/26・9/16 が巻き添えで乗る（初見なので通知され、記録される）
+  const first = calendar.run({ items: [seriesA, deleted0826, deleted0902, deleted0916] });
+  assert.equal(first.posts.length, 4);
+
+  // 2回目: 9/9 を消す。巻き添えの削除済みは updated・sequence・etag が全部動いて再送される
+  const drifted = (ev) => ({ ...ev, updated: '2026-08-14T02:51:00Z', sequence: 5, etag: '"9"' });
+  const second = calendar.run({
+    items: [
+      seriesA,
+      drifted(deleted0826),
+      drifted(deleted0902),
+      cancelledOccurrence('A_20260909', 'A', '2026-09-09T19:30:00+09:00', '2026-08-14T02:51:00Z'),
+      drifted(deleted0916),
+    ],
+  });
+
+  assert.deepEqual(headlines(second.posts), ['🗑️ 予定が削除されました']);
+  assert.match(second.posts[0], /2026-09-09T19:30:00\+09:00（繰り返しのうち1回）/);
+});
+
+test('削除済みの回が復活したら通知する（墓標は status の変化で外れる）', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA, deleted0902] });
+
+  // 9/2 を「削除の取り消し」などで復活させる
+  const restored = {
+    id: 'A_20260902', summary: 'ごはん', status: 'confirmed', etag: '"2"',
+    recurringEventId: 'A',
+    originalStartTime: { dateTime: '2026-09-02T19:30:00+09:00' },
+    start: { dateTime: '2026-09-02T19:30:00+09:00' }, end: { dateTime: '2026-09-02T20:30:00+09:00' },
+    created: '2021-05-20T00:00:00Z', updated: '2026-08-14T03:00:00Z',
+    reminders: { useDefault: true },
+  };
+  const second = calendar.run({ items: [restored] });
+
+  assert.equal(second.posts.length, 1, '復活が握りつぶされてはいけない');
+  assert.match(second.posts[0], /2026-09-02/);
+});
+
+test('シリーズ全体の削除も、管理情報だけ動いた再送は通知しない', () => {
+  const calendar = createSyncedCalendar();
+  calendar.run({ items: [seriesA] });
+
+  const cancelledSeries = { ...seriesA, status: 'cancelled', updated: '2026-08-14T03:00:00Z' };
+  const second = calendar.run({ items: [cancelledSeries] });
+  assert.deepEqual(headlines(second.posts), ['🗑️ 予定が削除されました'], '最初の削除は通知する');
+
+  const resent = { ...cancelledSeries, updated: '2026-08-14T03:10:00Z', sequence: 7, etag: '"9"' };
+  const third = calendar.run({ items: [resent] });
+  assert.equal(third.posts.length, 0, '削除済みシリーズの再送を繰り返し通知してはいけない');
+});
+
+test('過ぎた回は記録せず、保存済みの過去回の指紋も掃除する', () => {
+  // 「今」は 2026-08-14。過去回は isPastOccurrence_ が保存と無関係に毎回落とすので、
+  // 記録は容量の無駄でしかない（実測: 保存枠119件中約90件が2021〜2025年の過去回だった）
+  const calendar = createSyncedCalendar({
+    properties: {
+      [SEEN_KEY]: JSON.stringify([
+        ['A_20210612T040000Z', '0123456789abcdef'],   // 2021年の過去回 → 掃除される
+        ['A_20211205', '0123456789abcdef'],           // 終日の過去回 → 掃除される
+        ['B_R20230410T103000', '0123456789abcdef'],   // 「この回以降」で分割したシリーズ本体 → 残す
+      ]),
+    },
+  });
+
+  const pastStub = cancelledOccurrence('A_20260701', 'A', '2026-07-01T19:30:00+09:00', '2026-08-01T00:00:00Z');
+  calendar.run({ items: [seriesA, pastStub, deleted0902] });
+
+  const stored = JSON.parse(calendar.property(SEEN_KEY)).map((e) => e[0]);
+  assert.ok(!stored.includes('A_20260701'), '過去回を記録してはいけない');
+  assert.ok(!stored.includes('A_20210612T040000Z'), '過去回の指紋が掃除されていない');
+  assert.ok(!stored.includes('A_20211205'), '終日の過去回の指紋が掃除されていない');
+  assert.ok(stored.includes('B_R20230410T103000'), '分割シリーズ本体の指紋を消してはいけない');
+  assert.ok(stored.includes('A_20260902'), '未来の回は記録する');
+});
+
+test('指紋が8KBを超えたらシャードに分けて保存し、続きも読める', () => {
+  const calendar = createSyncedCalendar();
+  const many = [];
+  for (let i = 0; i < 250; i++) {
+    many.push({ ...single, id: 'evt-' + i + '-'.padEnd(40, 'x'), summary: '予定' + i });
+  }
+  calendar.run({ items: many });
+
+  const shard0 = calendar.property(SEEN_KEY);
+  const shard1 = calendar.property(SEEN_KEY + ':1');
+  assert.ok(shard0.length <= 8000, 'シャード0が8KBを超えている');
+  assert.ok(shard1, '溢れた分が続きのシャードに保存されていない');
+  assert.ok(shard1.length <= 8000, 'シャード1が8KBを超えている');
+  const total = JSON.parse(shard0).length + JSON.parse(shard1).length
+    + (calendar.property(SEEN_KEY + ':2') ? JSON.parse(calendar.property(SEEN_KEY + ':2')).length : 0);
+  assert.equal(total, 250, '全件がシャードのどこかに残っているはず');
+
+  // シャード1に落ちた古いイベントの再送も黙る
+  const second = calendar.run({ items: [many[many.length - 1]] });
+  assert.equal(second.posts.length, 0, 'シャードの続きにある指紋で抑止できていない');
+});
+
+test('過去回の掃除で指紋が減ったら、余ったシャードを消す', () => {
+  // シャード0は現役の指紋、シャード1は過去回の指紋で埋まっている状態を作る
+  const current = [];
+  for (let i = 0; i < 100; i++) {
+    current.push(['evt-' + i + '-'.padEnd(40, 'x'), '0123456789abcdef']);
+  }
+  const past = [];
+  for (let i = 0; i < 100; i++) {
+    past.push(['A_2021' + String(100 + i).slice(1, 3) + '01T040000Z', '0123456789abcdef']);
+  }
+  const calendar = createSyncedCalendar({
+    properties: {
+      [SEEN_KEY]: JSON.stringify(current),
+      [SEEN_KEY + ':1']: JSON.stringify(past),
+    },
+  });
+
+  calendar.run({ items: [single] });
+
+  assert.equal(calendar.property(SEEN_KEY + ':1'), null, '使わなくなったシャードが残っている');
+  const stored = JSON.parse(calendar.property(SEEN_KEY)).map((e) => e[0]);
+  assert.ok(stored.includes(current[0][0]), '現役の指紋まで消えている');
+});
+
+test('旧形式の下敷きマーカーなら、定期実行が下敷きを作り直す', () => {
+  // v2 より前のマーカーは ISO 日時だけ。旧形式の指紋（削除済みに中身の指紋を
+  // 使っていた頃）は墓標と一致しないので、作り直して現在の形式で埋め直す
+  const calendar = createSyncedCalendar({
+    properties: { ['FINGERPRINTS_PRIMED_AT:' + CALENDAR_ID]: '2026-08-18T04:06:45.712Z' },
+  });
+  let fullSyncs = 0;
+  const listImpl = (calendarId, params) => {
+    if (params.syncToken) return { items: [], nextSyncToken: 'tok-next' };
+    fullSyncs++;
+    return { items: [seriesA, deleted0916], nextSyncToken: 'tok-full' };
+  };
+
+  calendar.run({ listImpl });
+  assert.equal(fullSyncs, 1, '旧形式の下敷きを作り直していない');
+  assert.match(calendar.property('FINGERPRINTS_PRIMED_AT:' + CALENDAR_ID), /^v2\|/);
+
+  calendar.run({ listImpl });
+  assert.equal(fullSyncs, 1, '作り直しは1回だけ');
+});
+
 test('回を削除したときに一緒に返ってくるシリーズ本体は通知しない', () => {
   const calendar = createSyncedCalendar();
   const gym = { ...series('G', '2025-01-15T09:00:00+09:00', '2026-06-01T00:00:00Z'), summary: '🐸ジム' };

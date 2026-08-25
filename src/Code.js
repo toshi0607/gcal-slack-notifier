@@ -2,8 +2,9 @@
  *   CALENDAR_ID          監視対象カレンダーのID。カンマ区切りで複数指定できる
  *   SLACK_WEBHOOK_URL    Slack Incoming Webhook の URL
  *   SYNC_TOKEN:<カレンダーID>    差分同期用トークン（initialize() が自動で保存する。手動設定不要）
- *   SEEN_EVENTS:<カレンダーID>   直近に見たイベントの指紋（同上）
- *   FINGERPRINTS_PRIMED_AT:<カレンダーID>  指紋の下敷きを作った時刻（同上）
+ *   SEEN_EVENTS:<カレンダーID>   直近に見たイベントの指紋（同上）。8KBを超えた分は
+ *                                SEEN_EVENTS:<カレンダーID>:1 のような続きのシャードに分かれる
+ *   FINGERPRINTS_PRIMED_AT:<カレンダーID>  指紋の下敷きの形式と作った時刻（同上）
  *****/
 const PROP_CALENDAR_ID = 'CALENDAR_ID';
 const PROP_SLACK_WEBHOOK_URL = 'SLACK_WEBHOOK_URL';
@@ -24,10 +25,19 @@ const SINGLE_EVENTS = false;
 // Slack投稿のリトライ回数（429と5xxのみ再試行する）
 const SLACK_POST_ATTEMPTS = 3;
 
-// 指紋の保存量。Script Properties の1プロパティあたりの上限（9KB）に収める。
-// 溢れたら古いものから捨てる（捨てた分は次に出会ったとき通知される＝安全側）
-const SEEN_EVENTS_MAX_ENTRIES = 300;
-const SEEN_EVENTS_MAX_BYTES = 8000;
+// 指紋の保存量。Script Properties の1プロパティあたりの上限（9KB）に収まるよう、
+// 8KBごとに複数のプロパティ（シャード）へ分けて保存する。1プロパティ（約110件）では
+// 繰り返し予定の多いカレンダーの現役の指紋を持ちきれない（2026-08-25 実測: 8KBの枠が
+// 2シリーズ分の回だけで埋まり、他のシリーズの指紋が押し出されて巻き添え通知が再発し続けた）。
+// それでも溢れたら古いものから捨てる（捨てた分は次に出会ったとき通知される＝安全側）
+const SEEN_EVENTS_MAX_ENTRIES = 500;
+const SEEN_EVENTS_MAX_BYTES = 8000;   // 1シャードあたり
+const SEEN_EVENTS_MAX_SHARDS = 4;
+
+// 指紋の下敷きの形式。指紋の取り方を変えたら上げる。
+// マーカーがこの形式でないカレンダーは、定期実行が下敷きを作り直す
+// （古い取り方の指紋は新しい指紋と一致せず、抑止に使えないため）
+const PRIMED_FORMAT_PREFIX = 'v2|';
 
 // 指紋に含めないフィールド。中身が同じでも変わりうるもの・通知に関係しないもの。
 // ここに挙げていないフィールドは未知のものも含めて指紋に入る（変化を見落とさない側に倒す）
@@ -138,8 +148,9 @@ function syncTokenKey_(calendarId) {
   return PROP_SYNC_TOKEN_PREFIX + calendarId;
 }
 
-function seenEventsKey_(calendarId) {
-  return PROP_SEEN_EVENTS_PREFIX + calendarId;
+/** シャード0は従来の `SEEN_EVENTS:<カレンダーID>` そのもの（後方互換） */
+function seenEventsKey_(calendarId, shard) {
+  return PROP_SEEN_EVENTS_PREFIX + calendarId + (shard ? ':' + shard : '');
 }
 
 function primedAtKey_(calendarId) {
@@ -207,7 +218,7 @@ function primeFingerprints() {
 function primeCalendar_(store, calendarId, snapshot, excludedIds) {
   const recordable = snapshot.filter(function (ev) { return !excludedIds[ev.id]; });
   writeSeenEvents_(store, calendarId, readSeenEvents_(store, calendarId), recordable);
-  store.set(primedAtKey_(calendarId), new Date().toISOString());
+  store.set(primedAtKey_(calendarId), PRIMED_FORMAT_PREFIX + new Date().toISOString());
   return { recorded: recordable.length, held: snapshot.length - recordable.length };
 }
 
@@ -319,11 +330,13 @@ function notifyOneCalendar_(store, config, calendarId) {
     return 0;
   }
 
-  // 下敷きがまだ無いカレンダーは、この実行で作る。フル同期は差分の取得より**先**に行う。
+  // 下敷きが無い・古い形式のカレンダーは、この実行で作り直す。
+  // フル同期は差分の取得より**先**に行う。
   // 後にすると、その間に入った変更が「変更後」の姿で記録され、次の実行で通知が消える
-  const snapshot = store.get(primedAtKey_(calendarId)) === null
-    ? fullSync_(calendarId).items
-    : null;
+  const primedAt = store.get(primedAtKey_(calendarId));
+  const snapshot = primedAt !== null && primedAt.indexOf(PRIMED_FORMAT_PREFIX) === 0
+    ? null
+    : fullSync_(calendarId).items;
 
   let pageToken;
   let calendarName = '';
@@ -478,9 +491,23 @@ function isUnchangedResend_(ev, fingerprints) {
 /**
  * イベントの中身の指紋。`FINGERPRINT_IGNORED_FIELDS` 以外は未知のフィールドも含めて対象にする。
  * リマインダーだけの変更も `reminders` の差として指紋に出るため、取りこぼさない。
+ *
+ * 削除済み（status=cancelled）は中身を見ず、IDだけの「墓標」を指紋にする。
+ * 差分に乗る削除済みのペイロードは、親シリーズや兄弟の回を操作するたびに `updated` などの
+ * 管理情報が動き、中身の指紋では二度と一致しない（2026-08-22 実測: 5分差の2実行で
+ * 同じ削除済みの回が2回通知された。同じ2実行でシリーズ本体は `updated`・`sequence` を
+ * 除いた指紋の一致で黙っていた＝動いたのは管理情報だけ）。
+ * 削除済みに意味のある変化は「復活」だけで、そのとき status は confirmed に戻り
+ * 中身の指紋が墓標と一致しなくなるので、従来どおり通知される。
  */
 function eventFingerprint_(ev) {
+  if (ev.status === 'cancelled') return tombstoneFingerprint_(ev);
   return digest_(JSON.stringify(canonicalize_(ev, FINGERPRINT_IGNORED_FIELDS)));
+}
+
+/** 削除済みイベントの墓標。「このIDが削除済みであること」だけを表す */
+function tombstoneFingerprint_(ev) {
+  return digest_('cancelled:' + ev.id);
 }
 
 /**
@@ -493,6 +520,7 @@ function eventFingerprint_(ev) {
  * `extendedProperties.private.updated` のような利用者の値まで消えてしまう）。
  */
 function semanticFingerprint_(ev) {
+  if (ev.status === 'cancelled') return tombstoneFingerprint_(ev);
   const withoutBookkeeping = {};
   for (const key of Object.keys(ev)) {
     if (BOOKKEEPING_FIELDS.indexOf(key) >= 0) continue;
@@ -524,19 +552,25 @@ function canonicalize_(value, ignoredFields) {
 }
 
 /**
- * 保存済みの指紋。`[[イベントID, 中身の指紋, 管理情報を除いた指紋?], ...]` の新しい順。
- * 3つめはシリーズ本体にだけ付く。読めなければ空（＝何も落とさない）
+ * 保存済みの指紋。`[[イベントID, 中身の指紋, 管理情報を除いた指紋?], ...]` の新しい順で、
+ * 8KBごとのシャード（`SEEN_EVENTS:<カレンダーID>`、`:1`、`:2`…）に分かれる。
+ * 3つめはシリーズ本体にだけ付く。読めないシャードは飛ばす（＝その分を落とさないだけ）。
+ * 途中のシャードが欠けていても止まらない — 書き込みが途中で失敗して世代が混ざっても、
+ * 同じIDは先勝ち（新しい順）で引き当てるので新しい指紋が使われる
  */
 function readSeenEvents_(store, calendarId) {
-  const raw = store.get(seenEventsKey_(calendarId));
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    console.warn(calendarId + ': ' + seenEventsKey_(calendarId) + ' を読めないため作り直します: ' + e);
-    return [];
+  const entries = [];
+  for (let i = 0; i < SEEN_EVENTS_MAX_SHARDS; i++) {
+    const raw = store.get(seenEventsKey_(calendarId, i));
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) entries.push(...parsed);
+    } catch (e) {
+      console.warn(calendarId + ': ' + seenEventsKey_(calendarId, i) + ' を読めないため作り直します: ' + e);
+    }
   }
+  return entries;
 }
 
 function toFingerprintMaps_(entries) {
@@ -554,33 +588,76 @@ function toFingerprintMaps_(entries) {
 
 /**
  * 今回見たイベントの指紋を先頭に積み直して保存する。上限を超えた分は古い順に捨てる。
- * 通知したかどうかに関わらず、差分で見たものはすべて記録する（落とした回の再送も黙らせるため）。
+ * 通知したかどうかに関わらず、差分で見たものは記録する。ただし**過ぎた回は記録しない** —
+ * `isPastOccurrence_()` は保存の有無に関係なく毎回落とすので、記録しても抑止には
+ * 寄与せず、容量だけを食う（2026-08-25 実測: 保存枠119件のうち約90件が2021〜2025年の
+ * 過去回で埋まり、現役の指紋を押し出して巻き添え通知の再発源になっていた）。
+ * 保存済みのエントリも、IDに埋まる回の日付が過去になったものから掃除する。
  */
 function writeSeenEvents_(store, calendarId, previous, events) {
+  const cutoff = occurrencePruneCutoff_();
   const recorded = Object.create(null);
   const entries = [];
   const push = function (entry) {
     if (!entry[0] || recorded[entry[0]]) return;
+    if (isPastOccurrenceId_(entry[0], cutoff)) return;
     recorded[entry[0]] = true;
     entries.push(entry);
   };
   for (const ev of events) {
+    if (isPastOccurrence_(ev)) continue;
     // 管理情報を除いた指紋を持つのはシリーズ本体だけ。回の変更に伴う本体を黙らせるのに使う
-    push(ev.recurrence
+    push(ev.recurrence && ev.status !== 'cancelled'
       ? [ev.id, eventFingerprint_(ev), semanticFingerprint_(ev)]
       : [ev.id, eventFingerprint_(ev)]);
   }
   for (const entry of previous) {
     if (Array.isArray(entry) && entry.length >= 2) push(entry);
   }
-
   entries.length = Math.min(entries.length, SEEN_EVENTS_MAX_ENTRIES);
-  let json = JSON.stringify(entries);
-  while (entries.length && json.length > SEEN_EVENTS_MAX_BYTES) {
-    entries.pop();
-    json = JSON.stringify(entries);
+
+  // 新しい順のまま8KBずつシャードに詰める。シャード数の上限に収まらない分は古い順に捨てる
+  const shards = [[]];
+  let size = 2;  // '[]' のぶん
+  for (const entry of entries) {
+    const piece = JSON.stringify(entry);
+    if (size + piece.length + 1 > SEEN_EVENTS_MAX_BYTES) {
+      if (shards.length >= SEEN_EVENTS_MAX_SHARDS) break;
+      shards.push([]);
+      size = 2;
+    }
+    shards[shards.length - 1].push(entry);
+    size += piece.length + 1;
   }
-  store.set(seenEventsKey_(calendarId), json);
+  for (let i = 0; i < SEEN_EVENTS_MAX_SHARDS; i++) {
+    const key = seenEventsKey_(calendarId, i);
+    if (i < shards.length && shards[i].length) {
+      store.set(key, JSON.stringify(shards[i]));
+    } else if (store.get(key) !== null) {
+      store.remove(key);
+    }
+  }
+}
+
+/**
+ * 繰り返しの回のIDは末尾に回の日付を含む（`_20260829T040000Z`、終日なら `_20260829`）。
+ * その日付が基準日より前なら true。
+ * 「この回以降」で分割したシリーズ本体のID（`_R20230410T103000` など）は、
+ * 数字の直前が `_` でないため一致しない（本体の指紋を捨てない）。
+ */
+function isPastOccurrenceId_(id, cutoff) {
+  const match = /_(\d{8})(?:T\d{6}Z)?$/.exec(id);
+  return !!match && match[1] < cutoff;
+}
+
+/**
+ * 掃除の基準日（yyyyMMdd）。IDに埋まる日付はUTCで、スクリプトのタイムゾーンと
+ * 最大1日ずれうるので、消しすぎ（未来の回の指紋を捨てて通知が増える）側に
+ * 転ばないよう2日の猶予を置く
+ */
+function occurrencePruneCutoff_() {
+  const grace = new Date(new Date().getTime() - 2 * 24 * 60 * 60 * 1000);
+  return toCalendarDate_(grace).replace(/-/g, '');
 }
 
 /**
