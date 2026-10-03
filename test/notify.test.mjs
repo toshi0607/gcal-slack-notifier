@@ -979,3 +979,93 @@ test('1日あたりの呼び出し上限は再試行せずに諦める', () => {
   assert.match(String(result.error.message), /for one day/);
   assert.ok(!result.logs.some((l) => /再試行します/.test(l)), '日をまたぐまで直らないので待たない');
 });
+
+// 2026-10-03 の実測: 「この回以降」で分割したシリーズの後半の1回を消すと、
+// 前半の終了済みシリーズ（RRULE に過去の UNTIL を持つ本体）まで差分に乗った。
+const endedSeries = (id, recurrence, summary = 'ごはん', updated = '2026-10-03T00:00:00Z') => ({
+  id, summary, status: 'confirmed', etag: '"1"',
+  recurrence,
+  start: { dateTime: '2021-05-26T19:30:00+09:00' }, end: { dateTime: '2021-05-26T20:30:00+09:00' },
+  created: '2021-05-20T00:00:00Z', updated,
+  reminders: { useDefault: true },
+});
+const endedRule = ['RRULE:FREQ=WEEKLY;UNTIL=20230411T145959Z;BYDAY=WE'];
+
+test('終了済みシリーズ本体は、分割後の回の削除に巻き込まれて差分に乗っても通知しない（2026-09-11 の再現）', () => {
+  const calendar = createSyncedCalendar();
+  const continuation = series('W_R20230412T103000', '2023-04-12T19:30:00+09:00', '2026-09-01T00:00:00Z');
+
+  // 1回目: 後半のシリーズ本体を記録する
+  const first = calendar.run({ items: [continuation] });
+  assert.equal(first.posts.length, 1);
+
+  // 2回目: 後半の1回を消す。後半の本体は updated などだけが動き、前半の終了済み本体も乗る
+  const second = calendar.run({
+    items: [
+      { ...continuation, updated: '2026-09-11T05:00:00Z', sequence: 2 },
+      cancelledOccurrence('W_R20230412T103000_20260930T103000Z', 'W_R20230412T103000',
+        '2026-09-30T19:30:00+09:00', '2026-09-11T05:00:00Z'),
+      { ...endedSeries('W', endedRule), updated: '2026-09-11T05:00:00Z' },
+    ],
+  });
+
+  assert.deepEqual(headlines(second.posts), ['🗑️ 予定が削除されました']);
+  assert.match(second.posts[0], /2026-09-30/);
+  assert.ok(second.logs.some((l) => l.includes(CALENDAR_ID + ': 終了済みシリーズ本体 1件を通知対象から除外')));
+});
+
+test('終了済みシリーズの終了日を外して延ばしたら、終了済みではなくなるので通知する', () => {
+  const calendar = createSyncedCalendar();
+
+  const first = calendar.run({ items: [endedSeries('W', endedRule)] });
+  assert.equal(first.posts.length, 0);
+
+  const second = calendar.run({
+    items: [endedSeries('W', ['RRULE:FREQ=WEEKLY;BYDAY=WE'], 'ごはん', '2026-10-04T00:00:00Z')],
+  });
+  assert.equal(second.posts.length, 1);
+  assert.match(headlines(second.posts)[0], /✏️/);
+});
+
+test('UNTIL が未来のシリーズ本体は、変更を通知する', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({
+    items: [endedSeries('W', ['RRULE:FREQ=WEEKLY;UNTIL=20271231T145959Z;BYDAY=WE'], 'ごはん（変更）')],
+  });
+  assert.equal(result.posts.length, 1);
+});
+
+test('COUNT 付きのシリーズ本体は、終了済みとみなさず変更を通知する', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({
+    items: [endedSeries('W', ['RRULE:FREQ=WEEKLY;COUNT=10'], 'ごはん（変更）')],
+  });
+  assert.equal(result.posts.length, 1);
+});
+
+test('UNTIL が過去でも未来の RDATE があれば、シリーズ本体の変更を通知する', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({
+    items: [endedSeries('W', [...endedRule, 'RDATE;VALUE=DATE:20270101'])],
+  });
+  assert.equal(result.posts.length, 1);
+});
+
+test('日付だけの過去の UNTIL（終日の繰り返し）は終了済みとして通知しない', () => {
+  const calendar = createSyncedCalendar();
+  const allDay = {
+    ...endedSeries('W', ['RRULE:FREQ=WEEKLY;UNTIL=20230411;BYDAY=WE']),
+    start: { date: '2021-05-26' }, end: { date: '2021-05-27' },
+  };
+  const result = calendar.run({ items: [allDay] });
+  assert.equal(result.posts.length, 0);
+});
+
+test('終了済みシリーズ本体は SEEN_EVENTS に記録しない', () => {
+  const calendar = createSyncedCalendar();
+  const result = calendar.run({ items: [endedSeries('W', endedRule), single] });
+
+  assert.equal(result.posts.length, 1);
+  const stored = JSON.parse(calendar.property(SEEN_KEY)).map((e) => e[0]);
+  assert.deepEqual(stored, ['S1']);
+});
