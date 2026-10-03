@@ -371,10 +371,16 @@ function notifyOneCalendar_(store, config, calendarId) {
     console.log(calendarId + ': 巻き添えの再送 ' + resent + '件を通知対象から除外');
   }
 
-  const currentEvents = changedThisTime.filter(function (ev) { return !isPastOccurrence_(ev); });
-  const skipped = changedThisTime.length - currentEvents.length;
+  const notPast = changedThisTime.filter(function (ev) { return !isPastOccurrence_(ev); });
+  const skipped = changedThisTime.length - notPast.length;
   if (skipped > 0) {
     console.log(calendarId + ': 過去回の変更 ' + skipped + '件を通知対象から除外');
+  }
+
+  const currentEvents = notPast.filter(function (ev) { return !isEndedSeries_(ev); });
+  const ended = notPast.length - currentEvents.length;
+  if (ended > 0) {
+    console.log(calendarId + ': 終了済みシリーズ本体 ' + ended + '件を通知対象から除外');
   }
 
   // 「この回を通知する」ぶんのシリーズ本体は黙らせる。判定は通知する回だけを見る
@@ -610,7 +616,7 @@ function writeSeenEvents_(store, calendarId, previous, events) {
     entries.push(entry);
   };
   for (const ev of events) {
-    if (isPastOccurrence_(ev)) continue;
+    if (isPastOccurrence_(ev) || isEndedSeries_(ev)) continue;
     // 管理情報を除いた指紋を持つのはシリーズ本体だけ。回の変更に伴う本体を黙らせるのに使う
     push(ev.recurrence && !isCancelled_(ev)
       ? [ev.id, eventFingerprint_(ev), semanticFingerprint_(ev)]
@@ -699,6 +705,72 @@ function isPastOccurrence_(ev) {
   const date = point.date || (point.dateTime ? toCalendarDate_(point.dateTime) : '');
   if (!date) return false;
   return date < pastCutoffDate_(0);
+}
+
+/**
+ * 繰り返しの終了が確定した「終了済みシリーズ本体」かどうか。
+ *
+ * 2026-10-03 に実測: 「この回以降」で分割したシリーズ（後半のIDは `<元ID>_R<日時>`）で
+ * 後半の1回を削除すると、前半の終了済みシリーズ（RRULE に過去の UNTIL を持つ本体）まで
+ * `updated` だけが動いて差分に乗った。通知する回の親ではないのでシリーズ本体の巻き添え判定
+ * （`isSeriesEchoOfOccurrence_`）は効かず、指紋の下敷き（`timeMin=今` のフル同期）にも
+ * 終了済みシリーズは含まれないため、毎回「初見」として通知されていた。
+ *
+ * 終わったと言い切れるときだけ true を返し、迷うときは false（＝通知する側）に倒す。
+ * - シリーズ本体のみが対象（`recurrence` があり `recurringEventId` が無い）。`status` は見ない
+ * - すべての RRULE が UNTIL を持ち、その日付がすべて今日より前
+ * - UNTIL なし・COUNT 付き・今日以降の RDATE・解釈できない行があれば false
+ *
+ * トレードオフ: すでに終わったシリーズへの編集は通知されなくなる。
+ * UNTIL を外す・延ばすと終了済みでなくなるので、その編集は通知される。
+ */
+function isEndedSeries_(ev) {
+  if (ev.recurringEventId || !Array.isArray(ev.recurrence) || ev.recurrence.length === 0) return false;
+  const today = pastCutoffDate_(0);
+  let hasUntil = false;
+  for (const line of ev.recurrence) {
+    if (typeof line !== 'string') return false;
+    const upper = line.toUpperCase();
+    if (/^EXDATE[;:]/.test(upper)) continue;
+    if (upper.indexOf('RRULE:') === 0) {
+      const params = upper.slice('RRULE:'.length).split(';');
+      if (params.some(function (p) { return p.indexOf('COUNT=') === 0; })) return false;
+      const until = params.filter(function (p) { return p.indexOf('UNTIL=') === 0; })[0];
+      if (!until) return false;
+      // UNTIL はスクリプトのタイムゾーンの日付へ直して比べるので、猶予は0日（isPastOccurrence_ と同じ）。
+      // 保存済みIDの掃除が2日の猶予を置くのは、IDに埋まるUTCの文字列をそのまま比べるため
+      const endDate = recurrenceDateToCalendarDate_(until.slice('UNTIL='.length));
+      if (!endDate || endDate >= today) return false;
+      hasUntil = true;
+    } else if (/^RDATE[;:]/.test(upper)) {
+      const colon = line.indexOf(':');
+      if (colon < 0) return false;
+      const dates = line.slice(colon + 1).split(',');
+      for (const value of dates) {
+        const date = recurrenceDateToCalendarDate_(value.trim());
+        if (!date || date >= today) return false;
+      }
+    } else {
+      return false;
+    }
+  }
+  return hasUntil;
+}
+
+/**
+ * RRULE の UNTIL / RDATE の値（`YYYYMMDD` または `YYYYMMDDTHHMMSSZ`）を
+ * スクリプトのタイムゾーンの `yyyy-MM-dd` にする。解釈できなければ空文字。
+ * `new Date('20230411T145959Z')` は Invalid Date になるので、ISO形式へ直してから Date にする。
+ * 日付のみの値は終日予定の日付なのでタイムゾーン変換しない。Z の無い時刻つきの値は
+ * 基準のタイムゾーンが分からないため解釈しない
+ */
+function recurrenceDateToCalendarDate_(value) {
+  const match = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})Z)?$/.exec(value);
+  if (!match) return '';
+  const day = match[1] + '-' + match[2] + '-' + match[3];
+  if (match[4] === undefined) return day;
+  const date = new Date(day + 'T' + match[4] + ':' + match[5] + ':' + match[6] + 'Z');
+  return isNaN(date.getTime()) ? '' : toCalendarDate_(date);
 }
 
 /** yyyy-MM-dd をスクリプトのタイムゾーンで返す（ISO日付なので文字列比較で日付の前後が判定できる） */
