@@ -501,8 +501,13 @@ function isUnchangedResend_(ev, fingerprints) {
  * 中身の指紋が墓標と一致しなくなるので、従来どおり通知される。
  */
 function eventFingerprint_(ev) {
-  if (ev.status === 'cancelled') return tombstoneFingerprint_(ev);
+  if (isCancelled_(ev)) return tombstoneFingerprint_(ev);
   return digest_(JSON.stringify(canonicalize_(ev, FINGERPRINT_IGNORED_FIELDS)));
+}
+
+/** 削除済みか。指紋の墓標化・保存形式・通知種別の判定はすべてこの述語を通す */
+function isCancelled_(ev) {
+  return ev.status === 'cancelled';
 }
 
 /** 削除済みイベントの墓標。「このIDが削除済みであること」だけを表す */
@@ -520,7 +525,7 @@ function tombstoneFingerprint_(ev) {
  * `extendedProperties.private.updated` のような利用者の値まで消えてしまう）。
  */
 function semanticFingerprint_(ev) {
-  if (ev.status === 'cancelled') return tombstoneFingerprint_(ev);
+  if (isCancelled_(ev)) return tombstoneFingerprint_(ev);
   const withoutBookkeeping = {};
   for (const key of Object.keys(ev)) {
     if (BOOKKEEPING_FIELDS.indexOf(key) >= 0) continue;
@@ -607,7 +612,7 @@ function writeSeenEvents_(store, calendarId, previous, events) {
   for (const ev of events) {
     if (isPastOccurrence_(ev)) continue;
     // 管理情報を除いた指紋を持つのはシリーズ本体だけ。回の変更に伴う本体を黙らせるのに使う
-    push(ev.recurrence && ev.status !== 'cancelled'
+    push(ev.recurrence && !isCancelled_(ev)
       ? [ev.id, eventFingerprint_(ev), semanticFingerprint_(ev)]
       : [ev.id, eventFingerprint_(ev)]);
   }
@@ -629,13 +634,19 @@ function writeSeenEvents_(store, calendarId, previous, events) {
     shards[shards.length - 1].push(entry);
     size += piece.length + 1;
   }
-  for (let i = 0; i < SEEN_EVENTS_MAX_SHARDS; i++) {
+  // 使わなくなったシャードを**先に**消してから、新しい内容を書く。
+  // 逆順（書いてから消す）だと、途中で失敗したときに前世代のシャードが消されずに残り、
+  // 捨てたはずの指紋が生き返る。先に消す順なら、途中で失敗しても消えた分が
+  // 初見扱いに戻る（＝1回多く通知される）だけで、通知が消える側には倒れない。
+  // 同じ番号のシャードの書き込みが途中で失敗して世代が混ざる場合は、
+  // シャード0（今回の差分を含む新しい側）から先に書くこと＋同じIDの先勝ちで守られる
+  const used = shards[0].length ? shards.length : 0;
+  for (let i = SEEN_EVENTS_MAX_SHARDS - 1; i >= used; i--) {
     const key = seenEventsKey_(calendarId, i);
-    if (i < shards.length && shards[i].length) {
-      store.set(key, JSON.stringify(shards[i]));
-    } else if (store.get(key) !== null) {
-      store.remove(key);
-    }
+    if (store.get(key) !== null) store.remove(key);
+  }
+  for (let i = 0; i < used; i++) {
+    store.set(seenEventsKey_(calendarId, i), JSON.stringify(shards[i]));
   }
 }
 
@@ -647,17 +658,27 @@ function writeSeenEvents_(store, calendarId, previous, events) {
  */
 function isPastOccurrenceId_(id, cutoff) {
   const match = /_(\d{8})(?:T\d{6}Z)?$/.exec(id);
-  return !!match && match[1] < cutoff;
+  if (!match) return false;
+  const date = match[1].slice(0, 4) + '-' + match[1].slice(4, 6) + '-' + match[1].slice(6, 8);
+  return date < cutoff;
 }
 
 /**
- * 掃除の基準日（yyyyMMdd）。IDに埋まる日付はUTCで、スクリプトのタイムゾーンと
- * 最大1日ずれうるので、消しすぎ（未来の回の指紋を捨てて通知が増える）側に
- * 転ばないよう2日の猶予を置く
+ * 掃除の基準日。IDに埋まる日付はUTCで、スクリプトのタイムゾーンと最大1日ずれうるので、
+ * 消しすぎ（未来の回の指紋を捨てて通知が増える）側に転ばないよう2日の猶予を置く
  */
 function occurrencePruneCutoff_() {
-  const grace = new Date(new Date().getTime() - 2 * 24 * 60 * 60 * 1000);
-  return toCalendarDate_(grace).replace(/-/g, '');
+  return pastCutoffDate_(2);
+}
+
+/**
+ * 今日から `graceDays` 日さかのぼった日付（yyyy-MM-dd、スクリプトのタイムゾーン）。
+ * 「過ぎた回」の判定はライブの差分（`isPastOccurrence_`）も保存済みIDの掃除
+ * （`isPastOccurrenceId_`）も、必ずこの基準日と `toCalendarDate_()` を通す。
+ * 別々に日付を計算すると、タイムゾーンや猶予の変更が片方にだけ入って静かに食い違う
+ */
+function pastCutoffDate_(graceDays) {
+  return toCalendarDate_(new Date(new Date().getTime() - graceDays * 24 * 60 * 60 * 1000));
 }
 
 /**
@@ -677,7 +698,7 @@ function isPastOccurrence_(ev) {
   if (!point) return false;
   const date = point.date || (point.dateTime ? toCalendarDate_(point.dateTime) : '');
   if (!date) return false;
-  return date < toCalendarDate_(new Date());
+  return date < pastCutoffDate_(0);
 }
 
 /** yyyy-MM-dd をスクリプトのタイムゾーンで返す（ISO日付なので文字列比較で日付の前後が判定できる） */
@@ -728,7 +749,7 @@ function isSyncTokenExpired_(e) {
 function formatMessage_(calendarId, ev) {
   const title = resolveTitle_(calendarId, ev);
   const when = formatWhen_(ev);
-  if (ev.status === 'cancelled') {
+  if (isCancelled_(ev)) {
     return '🗑️ 予定が削除されました\n*' + title + '*\n日時: ' + when;
   }
   const isNew = new Date(ev.updated) - new Date(ev.created) < 60 * 1000;

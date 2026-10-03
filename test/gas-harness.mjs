@@ -67,7 +67,12 @@ export function createCalendar({ properties = {}, now = DEFAULT_NOW } = {}) {
       },
       Session: { getScriptTimeZone: () => 'Asia/Tokyo' },
       Utilities: {
-        formatDate: (d, timeZone) => new Intl.DateTimeFormat('sv-SE', { timeZone }).format(d),
+        // 本物は SimpleDateFormat のパターンを受け取る。src が実際に使うパターンだけ対応し、
+        // 知らないパターンは黙って別の形式を返さずに落とす（本番だけ壊れるのを防ぐ）
+        formatDate: (d, timeZone, pattern) => {
+          if (pattern !== 'yyyy-MM-dd') throw new Error('テストハーネス未対応の日付パターン: ' + pattern);
+          return new Intl.DateTimeFormat('sv-SE', { timeZone }).format(d);
+        },
         sleep: () => {},
         DigestAlgorithm: { MD5: 'MD5' },
         Charset: { UTF_8: 'UTF-8' },

@@ -188,6 +188,60 @@ test('過去回の掃除で指紋が減ったら、余ったシャードを消�
   assert.ok(stored.includes(current[0][0]), '現役の指紋まで消えている');
 });
 
+test('シャードの書き込みが途中で失敗しても、通知は失われず次の実行で復旧する', () => {
+  const calendar = createSyncedCalendar();
+  const many = [];
+  for (let i = 0; i < 250; i++) {
+    many.push({ ...single, id: 'evt-' + i + '-'.padEnd(40, 'x'), summary: '予定' + i });
+  }
+  calendar.run({ items: many });
+  const staleShard1 = calendar.property(SEEN_KEY + ':1');
+  assert.ok(staleShard1, '前提: シャード1がある');
+
+  // 新しいイベントを見た実行で、シャード1の書き込みだけが落ち続ける
+  const failed = calendar.run({
+    items: [{ ...single, id: 'evt-new' }],
+    storageFault: ({ op, key }) => {
+      if (op === 'setProperty' && key === SEEN_KEY + ':1') {
+        throw new Error("We're sorry, a server error occurred while reading from storage. Error code INTERNAL.");
+      }
+    },
+  });
+  assert.equal(failed.posts.length, 1, '記録より先に投稿しているので通知は出る');
+  assert.ok(failed.error, '書き込み失敗は握りつぶさない');
+  assert.equal(calendar.property(SEEN_KEY + ':1'), staleShard1, 'シャード1は前世代のまま残る');
+
+  // 新しい世代はシャード0に先に書かれており、同じIDは先勝ちで新しい指紋が使われる。
+  // 次の実行が正常なら再送も黙り、全シャードが書き直されて復旧する
+  const resend = calendar.run({ items: [{ ...single, id: 'evt-new' }] });
+  assert.equal(resend.error, null);
+  assert.equal(resend.posts.length, 0, 'シャード0の新しい指紋で再送を黙らせるはず');
+});
+
+test('シャードは、使わなくなったものを消してから新しい内容を書く', () => {
+  // 逆順（書いてから消す）だと、途中で失敗したときに前世代のシャードが残って
+  // 捨てたはずの指紋が生き返る。先に消す順なら失敗しても「1回多く通知」側に倒れる
+  const past = [];
+  for (let i = 0; i < 100; i++) {
+    past.push(['A_2021' + String(100 + i).slice(1, 3) + '01T040000Z', '0123456789abcdef']);
+  }
+  const calendar = createSyncedCalendar({
+    properties: {
+      [SEEN_KEY]: JSON.stringify([['keep-me', '0123456789abcdef']]),
+      [SEEN_KEY + ':1']: JSON.stringify(past),
+    },
+  });
+
+  const result = calendar.run({ items: [single] });
+
+  const ops = result.storageOps
+    .filter((o) => (o.op === 'setProperty' || o.op === 'deleteProperty') && o.key.startsWith('SEEN_EVENTS:'));
+  const firstSet = ops.findIndex((o) => o.op === 'setProperty');
+  const lastDelete = ops.map((o) => o.op).lastIndexOf('deleteProperty');
+  assert.ok(lastDelete >= 0, '前提: 余ったシャードの削除が起きる');
+  assert.ok(lastDelete < firstSet, '削除より先に書き込むと、失敗時に前世代が生き返る');
+});
+
 test('旧形式の下敷きマーカーなら、定期実行が下敷きを作り直す', () => {
   // v2 より前のマーカーは ISO 日時だけ。旧形式の指紋（削除済みに中身の指紋を
   // 使っていた頃）は墓標と一致しないので、作り直して現在の形式で埋め直す
