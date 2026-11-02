@@ -31,8 +31,8 @@ jobs:
     #   - CLASP_CREDENTIALS をこの Environment のシークレットにすると、他のジョブから読めなくなる
     environment: gas
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v4.4.0
+      - uses: actions/setup-node@v4.4.0
         with:
           node-version: '24'
           check-latest: true
